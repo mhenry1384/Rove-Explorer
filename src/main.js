@@ -670,10 +670,26 @@ function bindEvents() {
         const entry = tab.entries[Number(row.dataset.index)];
         state.activePane = index;
         if (state.editing) return;
+        const isToggle = (event.ctrlKey || event.metaKey) && entry.kind !== 'drive';
         if (event.shiftKey && entry.kind !== 'drive') {
           if (!tab.anchorId) tab.anchorId = tab.focusId || entry.id;
+          // Ctrl+Shift adds the range to what's already selected instead of replacing it.
+          const previous = isToggle ? tab.selected : [];
           selectRange(tab, tab.entries, tab.anchorId, entry.id);
+          if (isToggle) { const ids = new Set([...previous, ...tab.selected]); tab.selected = tab.entries.filter((item) => ids.has(item.id)).map((item) => item.id); }
           if (tab.path) remember(tab.path, entry.name);
+          saveSession(); render();
+          return;
+        }
+        if (isToggle) {
+          // Ctrl+click adds or removes one item, leaving the rest of the selection alone.
+          clearTimeout(entryClickTimer);
+          lastEntryClick = { id: null, time: 0 };
+          const ids = new Set(tab.selected);
+          if (ids.has(entry.id)) ids.delete(entry.id); else ids.add(entry.id);
+          tab.selected = tab.entries.filter((item) => ids.has(item.id)).map((item) => item.id);
+          tab.focusId = entry.id; tab.anchorId = entry.id;
+          if (tab.path && ids.has(entry.id)) remember(tab.path, entry.name);
           saveSession(); render();
           return;
         }
