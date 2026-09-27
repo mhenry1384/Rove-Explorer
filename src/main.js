@@ -121,9 +121,14 @@ function render() {
   const canGoBack = (activeTab?.historyIndex ?? 0) > 0;
   const canGoForward = !!activeTab && activeTab.historyIndex < (activeTab.history?.length ?? 1) - 1;
   const navHistory = `<button class="nav-history-button" data-go-back title="Back" aria-label="Go back" ${canGoBack ? '' : 'disabled'}>←</button><button class="nav-history-button" data-go-forward title="Forward" aria-label="Go forward" ${canGoForward ? '' : 'disabled'}>→</button><span class="toolbar-separator" aria-hidden="true"></span>`;
+  const otherPane = 1 - state.activePane;
+  // A file with an arrow leading away from it, mirrored when moving from the right pane to the left.
+  const moveIcon = `<svg class="move-icon ${state.activePane === 1 ? 'is-leftward' : ''}" viewBox="0 0 26 16" aria-hidden="true"><path class="move-icon-file" d="M2 1.5h5.5l3 3v10h-8.5z"/><path d="M7.5 1.5v3h3"/><path d="M14 8h10M20.5 4.5 24 8l-3.5 3.5"/></svg>`;
+  const moveTitle = canMoveToOtherPane() ? `Move selected items to ${currentTab(state.panes[otherPane]).path}` : 'Move selected items to the other pane';
+  const moveButton = `<button class="nav-history-button move-button" data-move-to-other-pane title="${escapeAttribute(moveTitle)}" aria-label="Move selected items to the other pane" ${canMoveToOtherPane() ? '' : 'disabled'}>${moveIcon}</button><span class="toolbar-separator" aria-hidden="true"></span>`;
   const scrollPositions = new Map();
   document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); if (scrollable) scrollPositions.set(el.dataset.pane, scrollable.scrollTop); });
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><span class="version-tag">v${APP_VERSION}</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><span class="version-tag">v${APP_VERSION}</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
   bindEvents();
   document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); const saved = scrollPositions.get(el.dataset.pane); if (scrollable && saved) scrollable.scrollTop = saved; });
   if (scrollSelectionIntoView) {
@@ -293,7 +298,9 @@ function goForward(index) {
 
 async function navigatePath(path) {
   const normalized = path.trim();
-  if (!currentTab(state.panes[state.activePane]) || !normalized) return;
+  if (!normalized) return;
+  const pane = state.panes[state.activePane];
+  if (!currentTab(pane)) { pane.tabs = [drivesTab(await loadDrives())]; pane.activeTab = 0; }
   await navigateTabTo(state.activePane, normalized);
 }
 
@@ -456,19 +463,23 @@ function setDragHover(el) {
   dragHoverEl?.classList.add('drop-target');
 }
 
-async function dropFilesIntoPane(paneIndex, destDir, paths) {
+// Drags between our own panes always move; drops from other apps follow Explorer's rule
+// of moving within a drive and copying across drives.
+function dropFilesIntoPane(paneIndex, destDir, paths) {
+  const cut = isInternalDrag(paths) || paths.every((path) => sameDrive(path, destDir));
+  return transferIntoPane(paneIndex, destDir, paths, { cut, verb: 'dropped' });
+}
+
+async function transferIntoPane(paneIndex, destDir, paths, { cut, verb }) {
   const tab = currentTab(state.panes[paneIndex]);
   if (!tab) return;
   const conflicts = await invoke('scan_paste_conflicts', { paths, destDir });
   let conflictResolution;
   if (conflicts.length) {
     const noun = conflicts.length === 1 ? 'file' : 'files';
-    const replaceAll = await ask(`${conflicts.length} ${noun} in the destination folder already exist. Replace them with the version being dropped, or skip them and keep the existing ones?`, { title: 'Files already exist', okLabel: 'Replace All', cancelLabel: 'Skip' });
+    const replaceAll = await ask(`${conflicts.length} ${noun} in the destination folder already exist. Replace them with the version being ${verb}, or skip them and keep the existing ones?`, { title: 'Files already exist', okLabel: 'Replace All', cancelLabel: 'Skip' });
     conflictResolution = replaceAll ? 'replace' : 'skip';
   }
-  // Drags between our own panes always move; drops from other apps follow Explorer's rule
-  // of moving within a drive and copying across drives.
-  const cut = isInternalDrag(paths) || paths.every((path) => sameDrive(path, destDir));
   const droppedPaths = await invoke('paste_entries', { paths, destDir, cut, conflictResolution });
   if (normalizePath(tab.path) === normalizePath(destDir)) {
     tab.entries = await load(tab.path);
@@ -479,6 +490,25 @@ async function dropFilesIntoPane(paneIndex, destDir, paths) {
     scrollSelectionIntoView = true;
   }
   render();
+}
+
+function isSameOrInside(path, folder) { const p = normalizePath(path); const f = normalizePath(folder); return p === f || p.startsWith(`${f}/`); }
+
+function canMoveToOtherPane() {
+  const tab = currentTab(state.panes[state.activePane]);
+  const destDir = currentTab(state.panes[1 - state.activePane])?.path;
+  if (!tab?.path || !destDir || tab.view === 'tree' || normalizePath(tab.path) === normalizePath(destDir)) return false;
+  const entries = selectedFileEntries(state.activePane);
+  // A folder can't be moved into itself or one of its own subfolders.
+  return entries.length > 0 && !entries.some((entry) => isSameOrInside(destDir, entry.path));
+}
+
+async function moveSelectedToOtherPane() {
+  if (!canMoveToOtherPane()) return;
+  const otherIndex = 1 - state.activePane;
+  const destDir = currentTab(state.panes[otherIndex]).path;
+  const paths = selectedFileEntries(state.activePane).map((entry) => entry.path);
+  await transferIntoPane(otherIndex, destDir, paths, { cut: true, verb: 'moved' });
 }
 
 function setupExternalDragDrop() {
@@ -782,6 +812,7 @@ function bindEvents() {
   });
   document.querySelector('[data-go-back]')?.addEventListener('click', () => goBack(state.activePane));
   document.querySelector('[data-go-forward]')?.addEventListener('click', () => goForward(state.activePane));
+  document.querySelector('[data-move-to-other-pane]')?.addEventListener('click', () => moveSelectedToOtherPane().catch((error) => console.error('move to other pane failed', error)));
   document.querySelector('#hidden-toggle').addEventListener('change', async (event) => { state.showHidden = event.currentTarget.checked; await Promise.all(state.panes.flatMap((pane) => pane.tabs.filter((tab) => tab.path).map(async (tab) => { tab.entries = await load(tab.path); }))); render(); });
   const locationInput = document.querySelector('#location-input');
   // Select everything on focus; the mouseup that follows a click-to-focus would otherwise drop the selection to a caret.
@@ -855,6 +886,11 @@ document.addEventListener('click', (event) => {
 }, true);
 document.addEventListener('contextmenu', (event) => { if (state.contextMenu && !event.target.closest('.context-menu')) { state.contextMenu = null; } }, true);
 
+function drivesTab(drives, savedSelected) {
+  const selected = validOrFirst(drives, savedSelected);
+  return { path: '', kind: 'drives', label: COMPUTER_LABEL, entries: drives, selected, focusId: selected[selected.length - 1] || null, anchorId: selected[0] || null, history: [''], historyIndex: 0 };
+}
+
 async function start() {
   state.folders = configuredFolders.map((path) => ({ path, label: folderLabel(path) }));
   invoke('platform_name').then((name) => { platformName = name; }).catch(() => {});
@@ -865,11 +901,13 @@ async function start() {
   for (let index = 0; index < state.panes.length; index += 1) {
     const saved = savedPanes[index];
     const tabs = saved?.tabs?.length ? await Promise.all(saved.tabs.map(async (item) => {
-      if (!item.path) { const selected = validOrFirst(drives, item.selected); return { path: '', kind: 'drives', label: COMPUTER_LABEL, entries: drives, selected, focusId: selected[selected.length - 1] || null, anchorId: selected[0] || null, history: [''], historyIndex: 0 }; }
-      const entries = await load(item.path);
+      if (!item.path) return drivesTab(drives, item.selected);
+      // A saved folder may have since been moved or deleted; fall back to the drive list rather than failing startup.
+      let entries;
+      try { entries = await load(item.path); } catch { return drivesTab(drives); }
       const selected = validOrFirst(entries, item.selected);
       return { ...item, kind: 'folder', entries, selected, focusId: selected[selected.length - 1] || null, anchorId: selected[0] || null, history: [item.path], historyIndex: 0 };
-    })) : [{ path: '', kind: 'drives', label: COMPUTER_LABEL, entries: drives, selected: toSelection(firstEntryId(drives)), focusId: firstEntryId(drives), anchorId: firstEntryId(drives), history: [''], historyIndex: 0 }];
+    })) : [drivesTab(drives)];
     state.panes[index] = { tabs, activeTab: Math.min(saved?.activeTab || 0, tabs.length - 1) };
   }
   render();

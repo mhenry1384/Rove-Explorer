@@ -36,3 +36,12 @@ html, body, #app { height: 100%; overflow: hidden; }
 .context-menu button { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 8px 12px; font: 11px 'DM Mono'; color: var(--ink); }
 .context-menu button:hover { background: #f2f4e5; }
 .context-menu button.danger:hover { background: #f6dede; color: #b3261e; }
+
+.move-button { width: 52px; border-color: #a9b168; background: #f4f7df; }
+.move-button:hover:not(:disabled) { background: var(--lime); border-color: #6b7a1c; }
+.move-button:disabled { border-color: var(--line); background: transparent; }
+.move-icon { width: 30px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.move-icon.is-leftward { transform: scaleX(-1); }
+.move-icon-file { fill: var(--lime); }
+.move-button:hover:not(:disabled) .move-icon-file { fill: #fff; }
+.move-button:disabled .move-icon-file { fill: none; }
