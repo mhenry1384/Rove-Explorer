@@ -1,9 +1,11 @@
 import './style.css';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { homeDir, sep } from '@tauri-apps/api/path';
+import { homeDir, sep, resolveResource } from '@tauri-apps/api/path';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { openPath } from '@tauri-apps/plugin-opener';
 import { ask } from '@tauri-apps/plugin-dialog';
+import { startDrag } from '@crabnebula/tauri-plugin-drag';
 import configuredFolders from '../config/folders.json';
 import { version as APP_VERSION } from '../package.json';
 
@@ -14,14 +16,26 @@ const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }],
 const stored = JSON.parse(localStorage.getItem('rove-state') || '{}');
 const session = JSON.parse(localStorage.getItem('rove-session') || '{}');
 const DOUBLE_CLICK_MS = 400;
+const VIEW_MODES = [
+  { id: 'details', label: 'Details', icon: '<path d="M2 3.5h12M2 8h12M2 12.5h12"/>' },
+  { id: 'tree', label: 'Tree View', icon: '<path d="M3 2.5v9.5h4M3 7h4"/><rect x="8" y="5" width="6" height="4"/><rect x="8" y="10" width="6" height="4"/>' },
+  { id: 'thumbnails', label: 'Thumbnails', icon: '<rect x="2" y="2" width="5" height="5"/><rect x="9" y="2" width="5" height="5"/><rect x="2" y="9" width="5" height="5"/><rect x="9" y="9" width="5" height="5"/>' },
+];
 let lastEntryClick = { id: null, time: 0 };
 let entryClickTimer = null;
+// The row press that might still turn into a drag; resolved on the next pointermove/pointerup.
+let pendingPress = null;
+const DRAG_THRESHOLD_PX = 5;
 let lastWatchedKey = '';
 let scrollSelectionIntoView = false;
 const TYPE_AHEAD_TIMEOUT_MS = 1000;
 let typeAheadBuffer = '';
 let typeAheadTime = 0;
 const fsChangeTimers = new Map();
+let platformName = isWindows ? 'windows' : 'other';
+let dragIconPath = null;
+let internalDragPaths = null;
+let dragHoverEl = null;
 function normalizePath(path) { return path.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase(); }
 
 function currentTab(pane) { return pane.tabs[pane.activeTab]; }
@@ -109,7 +123,7 @@ function render() {
   const navHistory = `<button class="nav-history-button" data-go-back title="Back" aria-label="Go back" ${canGoBack ? '' : 'disabled'}>←</button><button class="nav-history-button" data-go-forward title="Forward" aria-label="Go forward" ${canGoForward ? '' : 'disabled'}>→</button><span class="toolbar-separator" aria-hidden="true"></span>`;
   const scrollPositions = new Map();
   document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); if (scrollable) scrollPositions.set(el.dataset.pane, scrollable.scrollTop); });
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><span class="version-tag">v${APP_VERSION}</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin <kbd>Ctrl</kbd>+<kbd>C</kbd>/<kbd>X</kbd>/<kbd>V</kbd> copy, cut, paste <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><span class="version-tag">v${APP_VERSION}</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
   bindEvents();
   document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); const saved = scrollPositions.get(el.dataset.pane); if (scrollable && saved) scrollable.scrollTop = saved; });
   if (scrollSelectionIntoView) {
@@ -149,12 +163,32 @@ function scheduleFolderReload(changedPath) {
   }, 200));
 }
 
+function textEditorLabel() { return platformName === 'macos' ? 'Edit in TextEdit' : 'Edit in Notepad'; }
+function canEditInTextEditor(pane) { return (platformName === 'windows' || platformName === 'macos') && selectedFileEntries(pane).some((entry) => entry.kind === 'file'); }
+
+// What a context menu's Properties item describes: the clicked selection, the clicked tree folder,
+// or (for a right-click on empty space) the folder the pane is showing.
+function propertiesPaths(menu) {
+  if (menu.kind === 'tree') return [menu.path];
+  if (menu.kind === 'pane') { const path = currentTab(state.panes[menu.pane])?.path; return path ? [path] : []; }
+  return selectedFileEntries(menu.pane).map((entry) => entry.path);
+}
+
+function showProperties(menu) {
+  const paths = propertiesPaths(menu);
+  state.contextMenu = null;
+  render();
+  if (paths.length) invoke('show_properties', { paths }).catch((error) => console.error('show_properties failed', error));
+}
+
 function renderContextMenu() {
   if (!state.contextMenu) return '';
-  const { x, y, kind } = state.contextMenu;
+  const { x, y, kind, pane } = state.contextMenu;
+  const tab = currentTab(state.panes[pane]);
+  const properties = platformName === 'windows' && propertiesPaths(state.contextMenu).length ? '<button data-context-properties>Properties</button>' : '';
   const items = kind === 'pane'
-    ? '<button data-context-paste>Paste</button>'
-    : `${kind === 'file' ? '<button data-context-copy>Copy</button><button data-context-cut>Cut</button>' : ''}<button class="danger" data-context-delete>Delete</button>`;
+    ? `${tab?.path ? '<button data-context-new-folder>New Folder</button><button data-context-new-file>New File</button>' : ''}<button data-context-paste>Paste</button>${properties}`
+    : `${kind === 'file' ? `<button data-context-copy>Copy</button><button data-context-cut>Cut</button>${canEditInTextEditor(pane) ? `<button data-context-edit-notepad>${textEditorLabel()}</button>` : ''}` : ''}<button class="danger" data-context-delete>Delete</button>${properties}`;
   return `<div class="context-menu" data-context-menu style="left:${x}px; top:${y}px">${items}</div>`;
 }
 
@@ -212,7 +246,7 @@ function renderPane(pane, index) {
     : view === 'thumbnails'
       ? `<div class="table-wrap thumb-wrap">${renderThumbnails(entries, selected, focusId, index)}</div>`
       : `<div class="table-wrap"><div class="table-head ${isDriveRoot ? 'drive-head' : ''}">${headers}</div><div class="rows">${rows}</div></div>`;
-  const viewSelect = tab?.path ? `<select class="view-select" data-view-select aria-label="Pane view"><option value="details" ${view === 'details' ? 'selected' : ''}>Details</option><option value="tree" ${view === 'tree' ? 'selected' : ''}>Tree View</option><option value="thumbnails" ${view === 'thumbnails' ? 'selected' : ''}>Thumbnails</option></select>` : '';
+  const viewSelect = tab?.path ? `<div class="view-switch" role="group" aria-label="Pane view"><span class="view-label">${VIEW_MODES.find((mode) => mode.id === view)?.label ?? ''}</span>${VIEW_MODES.map((mode) => `<button class="view-button ${mode.id === view ? 'active' : ''}" data-view-mode="${mode.id}" title="${mode.label}" aria-label="${mode.label}" aria-pressed="${mode.id === view}"><svg viewBox="0 0 16 16" aria-hidden="true">${mode.icon}</svg></button>`).join('')}</div>` : '';
   return `<article class="pane ${state.activePane === index ? 'is-active' : ''}" data-pane="${index}"><div class="tabs">${pane.tabs.map((item, tabIndex) => `<button class="tab ${tabIndex === pane.activeTab ? 'active' : ''}" data-tab="${tabIndex}"><span class="tab-dot"></span>${item.label}<span class="tab-close">×</span></button>`).join('')}<button class="new-tab" data-new-tab title="New tab">＋</button></div><div class="pathbar"><button class="nav-button" data-up title="Go up one level" aria-label="Go up one level">↑</button><div class="path-text">${breadcrumb}</div><span class="item-count">${entries.length} ITEMS</span></div>${body}<div class="pane-footer"><span class="selection-label">${selected.length ? `${selected.length} SELECTED` : 'NOTHING SELECTED'}</span>${viewSelect}</div></article>`;
 }
 
@@ -354,6 +388,114 @@ async function pasteIntoPane(index) {
   render();
 }
 
+async function createNewEntry(index, command) {
+  const tab = currentTab(state.panes[index]);
+  state.contextMenu = null;
+  if (!tab?.path) { render(); return; }
+  const path = await invoke(command, { destDir: tab.path });
+  tab.entries = await load(tab.path);
+  const entry = tab.entries.find((item) => item.path === path);
+  if (!entry) { render(); return; }
+  selectSingle(tab, entry.id);
+  saveSession();
+  startRename(index, entry);
+}
+
+async function editSelectedInTextEditor(index) {
+  const entries = selectedFileEntries(index).filter((entry) => entry.kind === 'file');
+  state.contextMenu = null;
+  render();
+  if (!entries.length) return;
+  await invoke('edit_in_text_editor', { paths: entries.map((entry) => entry.path) }).catch((error) => console.error('edit_in_text_editor failed', error));
+}
+
+async function startEntryDrag(index, entry) {
+  const tab = currentTab(state.panes[index]);
+  const selected = new Set(tab?.selected || []);
+  const dragEntries = selected.has(entry.id) ? tab.entries.filter((item) => selected.has(item.id)) : [entry];
+  const paths = dragEntries.map((item) => item.path);
+  if (!paths.length || !dragIconPath) return;
+  internalDragPaths = paths;
+  try { await startDrag({ item: paths, icon: dragIconPath }); } catch (error) { console.error('startDrag failed', error); }
+  // The webview's drop event can arrive after startDrag resolves, so keep the marker briefly.
+  setTimeout(() => { if (internalDragPaths === paths) internalDragPaths = null; }, 1000);
+}
+
+function isInternalDrag(paths) {
+  if (!internalDragPaths || internalDragPaths.length !== paths.length) return false;
+  const dragged = new Set(internalDragPaths.map(normalizePath));
+  return paths.every((path) => dragged.has(normalizePath(path)));
+}
+
+function driveOf(path) {
+  if (!isWindows) return '/';
+  const match = /^[A-Za-z]:/.exec(path);
+  return match ? match[0].toLowerCase() : '';
+}
+function sameDrive(a, b) { return driveOf(a) === driveOf(b); }
+
+function dropTargetAt(position) {
+  const scale = window.devicePixelRatio || 1;
+  const el = document.elementFromPoint(position.x / scale, position.y / scale);
+  const paneEl = el?.closest('.pane');
+  if (!paneEl) return null;
+  const paneIndex = Number(paneEl.dataset.pane);
+  const tab = currentTab(state.panes[paneIndex]);
+  if (!tab) return null;
+  const rowEl = el.closest('[data-entry]');
+  const row = rowEl && tab.entries[Number(rowEl.dataset.index)];
+  const destDir = row && (row.kind === 'folder' || row.kind === 'drive') ? row.path : tab.path;
+  if (!destDir) return null;
+  return { paneIndex, destDir, hoverEl: row ? rowEl : paneEl };
+}
+
+function setDragHover(el) {
+  if (dragHoverEl === el) return;
+  dragHoverEl?.classList.remove('drop-target');
+  dragHoverEl = el || null;
+  dragHoverEl?.classList.add('drop-target');
+}
+
+async function dropFilesIntoPane(paneIndex, destDir, paths) {
+  const tab = currentTab(state.panes[paneIndex]);
+  if (!tab) return;
+  const conflicts = await invoke('scan_paste_conflicts', { paths, destDir });
+  let conflictResolution;
+  if (conflicts.length) {
+    const noun = conflicts.length === 1 ? 'file' : 'files';
+    const replaceAll = await ask(`${conflicts.length} ${noun} in the destination folder already exist. Replace them with the version being dropped, or skip them and keep the existing ones?`, { title: 'Files already exist', okLabel: 'Replace All', cancelLabel: 'Skip' });
+    conflictResolution = replaceAll ? 'replace' : 'skip';
+  }
+  // Drags between our own panes always move; drops from other apps follow Explorer's rule
+  // of moving within a drive and copying across drives.
+  const cut = isInternalDrag(paths) || paths.every((path) => sameDrive(path, destDir));
+  const droppedPaths = await invoke('paste_entries', { paths, destDir, cut, conflictResolution });
+  if (normalizePath(tab.path) === normalizePath(destDir)) {
+    tab.entries = await load(tab.path);
+    const droppedNames = new Set(droppedPaths.map((path) => path.split(/[\\/]/).pop()));
+    const droppedIds = tab.entries.filter((entry) => droppedNames.has(entry.name)).map((entry) => entry.id);
+    if (droppedIds.length) { tab.selected = droppedIds; tab.focusId = droppedIds[droppedIds.length - 1]; tab.anchorId = droppedIds[0]; }
+    saveSession();
+    scrollSelectionIntoView = true;
+  }
+  render();
+}
+
+function setupExternalDragDrop() {
+  getCurrentWebview().onDragDropEvent((event) => {
+    const payload = event.payload;
+    if (payload.type === 'over' || payload.type === 'enter') {
+      setDragHover(dropTargetAt(payload.position)?.hoverEl || null);
+      return;
+    }
+    setDragHover(null);
+    if (payload.type !== 'drop') return;
+    const target = dropTargetAt(payload.position);
+    if (!target || !payload.paths?.length) return;
+    dropFilesIntoPane(target.paneIndex, target.destDir, payload.paths).catch((error) => console.error('drop failed', error));
+  });
+}
+
 function handleTypeAhead(index, char) {
   const tab = currentTab(state.panes[index]);
   const entries = tab?.entries;
@@ -489,6 +631,14 @@ function setPaneView(index, view) {
   render();
 }
 
+function openTreeNodeInDetails(index, path) {
+  const tab = currentTab(state.panes[index]);
+  if (!tab || tab.view !== 'tree') return;
+  if (tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
+  tab.view = 'details'; tab.treeState = null;
+  navigateTabTo(index, path);
+}
+
 function toggleTreeNode(index, path) {
   const expanded = currentTab(state.panes[index])?.treeState?.expanded;
   if (!expanded) return;
@@ -514,7 +664,7 @@ function bindEvents() {
     });
     element.querySelectorAll('[data-entry]').forEach((row) => {
       let suppressNextClick = false;
-      const activate = (event) => {
+      const activate = (event, fromPointer) => {
         event.stopPropagation();
         const tab = currentTab(pane);
         const entry = tab.entries[Number(row.dataset.index)];
@@ -532,11 +682,18 @@ function bindEvents() {
         lastEntryClick = { id: entry.id, time: now };
         clearTimeout(entryClickTimer);
         if (isDoubleClick) { lastEntryClick = { id: null, time: 0 }; enter(index, entry); return; }
-        if (entry.kind !== 'drive' && tab.selected.length === 1 && tab.selected[0] === entry.id) {
+        const isSoleSelection = tab.selected.length === 1 && tab.selected[0] === entry.id;
+        if (fromPointer && entry.kind !== 'drive') {
+          // Like Explorer, pressing an already-selected item keeps the selection intact so it can be
+          // dragged; rename (or collapsing a multi-selection) only happens once the button is released.
+          const wasSelected = tab.selected.includes(entry.id);
+          pendingPress = { index, entry, x: event.clientX, y: event.clientY, renameOnRelease: isSoleSelection, selectOnRelease: wasSelected && !isSoleSelection };
+          if (wasSelected) return;
+        } else if (entry.kind !== 'drive' && isSoleSelection) {
           entryClickTimer = setTimeout(() => startRename(index, entry), DOUBLE_CLICK_MS);
-        } else {
-          selectSingle(tab, entry.id); if (tab.path) remember(tab.path, entry.name); saveSession(); render();
+          return;
         }
+        selectSingle(tab, entry.id); if (tab.path) remember(tab.path, entry.name); saveSession(); render();
       };
       // pointerdown fires immediately; the derived `click` event can lag ~200ms behind it on
       // Windows precision touchpads/touchscreens while the OS gesture recognizer rules out a
@@ -549,7 +706,7 @@ function bindEvents() {
         // causing the clicked row to jump to the bottom of the pane.
         event.preventDefault();
         suppressNextClick = true;
-        activate(event);
+        activate(event, true);
       });
       row.addEventListener('click', (event) => {
         if (suppressNextClick) { suppressNextClick = false; return; }
@@ -566,15 +723,18 @@ function bindEvents() {
         state.contextMenu = { pane: index, kind: 'file', entryId: entry.id, x: event.clientX, y: event.clientY };
         render();
       });
+      // Drags are started from pointermove (see pendingPress); keep the browser's own drag (e.g. of a thumbnail image) out of the way.
+      row.addEventListener('dragstart', (event) => event.preventDefault());
     });
     element.querySelectorAll('[data-tab]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); state.activePane = index; pane.activeTab = Number(button.dataset.tab); saveSession(); render(); }));
     element.querySelector('[data-new-tab]').addEventListener('click', async (event) => { event.stopPropagation(); const current = currentTab(pane); const path = current?.path || ''; const entries = path ? await load(path) : await loadDrives(); const selected = rememberedOrFirst(entries, path ? stored[path]?.name : null); const focusId = selected[0] || null; pane.tabs.push(path ? { path, kind: 'folder', label: path.split(/[\\/]/).pop(), entries, selected, focusId, anchorId: focusId, history: [path], historyIndex: 0 } : { path: '', kind: 'drives', label: COMPUTER_LABEL, entries, selected, focusId, anchorId: focusId, history: [''], historyIndex: 0 }); pane.activeTab = pane.tabs.length - 1; saveSession(); render(); });
     element.querySelector('[data-up]').addEventListener('click', (event) => { event.stopPropagation(); goUp(index); });
     element.querySelectorAll('[data-breadcrumb]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); navigateToPath(index, button.dataset.breadcrumb); }));
-    const viewSelectEl = element.querySelector('[data-view-select]');
-    viewSelectEl?.addEventListener('mousedown', (event) => event.stopPropagation());
-    viewSelectEl?.addEventListener('click', (event) => event.stopPropagation());
-    viewSelectEl?.addEventListener('change', (event) => { event.stopPropagation(); setPaneView(index, event.currentTarget.value); });
+    element.querySelectorAll('[data-view-mode]').forEach((button) => button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      state.activePane = index;
+      if (currentTab(pane)?.view !== button.dataset.viewMode) setPaneView(index, button.dataset.viewMode); else render();
+    }));
     element.querySelector('[data-tree-cancel]')?.addEventListener('click', (event) => { event.stopPropagation(); cancelTreeView(index); });
     element.querySelectorAll('[data-tree-node]').forEach((row) => {
       row.addEventListener('click', (event) => {
@@ -585,6 +745,11 @@ function bindEvents() {
         const tab = currentTab(pane);
         if (tab?.treeState) tab.treeState.selected = path;
         render();
+      });
+      row.addEventListener('dblclick', (event) => {
+        if (event.target.closest('[data-tree-caret]')) return;
+        event.stopPropagation();
+        openTreeNodeInDetails(index, row.dataset.treeNode);
       });
       row.addEventListener('contextmenu', (event) => {
         event.preventDefault(); event.stopPropagation();
@@ -602,7 +767,13 @@ function bindEvents() {
   document.querySelector('[data-go-back]')?.addEventListener('click', () => goBack(state.activePane));
   document.querySelector('[data-go-forward]')?.addEventListener('click', () => goForward(state.activePane));
   document.querySelector('#hidden-toggle').addEventListener('change', async (event) => { state.showHidden = event.currentTarget.checked; await Promise.all(state.panes.flatMap((pane) => pane.tabs.filter((tab) => tab.path).map(async (tab) => { tab.entries = await load(tab.path); }))); render(); });
-  document.querySelector('#location-input').addEventListener('keydown', (event) => { if (event.key !== 'Enter') return; event.preventDefault(); const input = event.currentTarget; navigatePath(input.value).catch(() => input.select()); });
+  const locationInput = document.querySelector('#location-input');
+  // Select everything on focus; the mouseup that follows a click-to-focus would otherwise drop the selection to a caret.
+  let justFocusedLocation = false;
+  locationInput.addEventListener('focus', (event) => { event.currentTarget.select(); justFocusedLocation = true; });
+  locationInput.addEventListener('mouseup', (event) => { if (justFocusedLocation) event.preventDefault(); justFocusedLocation = false; });
+  locationInput.addEventListener('blur', () => { justFocusedLocation = false; });
+  locationInput.addEventListener('keydown', (event) => { if (event.key !== 'Enter') return; event.preventDefault(); const input = event.currentTarget; navigatePath(input.value).catch(() => input.select()); });
   const renameInput = document.querySelector('[data-rename]'); renameInput?.addEventListener('click', (event) => event.stopPropagation()); renameInput?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelRename(); } if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); } }); renameInput?.addEventListener('blur', (event) => { const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); if (entry) finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); });
   const contextMenu = document.querySelector('[data-context-menu]');
   contextMenu?.addEventListener('click', (event) => event.stopPropagation());
@@ -616,6 +787,10 @@ function bindEvents() {
   document.querySelector('[data-context-copy]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) copySelected(menu.pane); });
   document.querySelector('[data-context-cut]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) cutSelected(menu.pane); });
   document.querySelector('[data-context-paste]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) pasteIntoPane(menu.pane); });
+  document.querySelector('[data-context-new-file]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) createNewEntry(menu.pane, 'create_file'); });
+  document.querySelector('[data-context-new-folder]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) createNewEntry(menu.pane, 'create_folder'); });
+  document.querySelector('[data-context-properties]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) showProperties(menu); });
+  document.querySelector('[data-context-edit-notepad]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) editSelectedInTextEditor(menu.pane); });
 }
 
 document.addEventListener('keydown', (event) => {
@@ -631,10 +806,33 @@ document.addEventListener('keydown', (event) => {
   if (event.altKey && event.key === 'ArrowRight') { event.preventDefault(); goForward(state.activePane); return; }
   if (isTyping) return;
   if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveSelection(state.activePane, event.key === 'ArrowUp' ? -1 : 1, event.shiftKey); return; }
+  if ((event.key === 'Home' || event.key === 'End') && tab?.view !== 'tree') { event.preventDefault(); moveSelection(state.activePane, event.key === 'Home' ? -Infinity : Infinity, event.shiftKey); return; }
+  if (event.key === 'Enter' && tab?.view === 'tree') { event.preventDefault(); if (tab.treeState?.selected) openTreeNodeInDetails(state.activePane, tab.treeState.selected); return; }
   if (event.key === 'Enter') { event.preventDefault(); enter(state.activePane, tab?.entries.find((entry) => entry.id === tab.focusId)); return; }
   if (event.key === 'Backspace') { event.preventDefault(); goUp(state.activePane); return; }
   if (!state.contextMenu && !event.ctrlKey && !event.altKey && !event.metaKey && event.key.length === 1) { event.preventDefault(); handleTypeAhead(state.activePane, event.key); }
 });
+document.addEventListener('pointermove', (event) => {
+  if (!pendingPress) return;
+  if (!(event.buttons & 1)) { pendingPress = null; return; }
+  if (Math.hypot(event.clientX - pendingPress.x, event.clientY - pendingPress.y) < DRAG_THRESHOLD_PX) return;
+  const { index, entry } = pendingPress;
+  pendingPress = null;
+  clearTimeout(entryClickTimer);
+  lastEntryClick = { id: null, time: 0 };
+  startEntryDrag(index, entry);
+});
+document.addEventListener('pointerup', () => {
+  if (!pendingPress) return;
+  const { index, entry, renameOnRelease, selectOnRelease } = pendingPress;
+  pendingPress = null;
+  if (renameOnRelease) { entryClickTimer = setTimeout(() => startRename(index, entry), DOUBLE_CLICK_MS); return; }
+  if (selectOnRelease) {
+    const tab = currentTab(state.panes[index]);
+    selectSingle(tab, entry.id); if (tab.path) remember(tab.path, entry.name); saveSession(); render();
+  }
+});
+document.addEventListener('pointercancel', () => { pendingPress = null; });
 document.addEventListener('click', (event) => {
   if (!state.contextMenu || event.target.closest('.context-menu')) return;
   state.contextMenu = null; render();
@@ -643,6 +841,9 @@ document.addEventListener('contextmenu', (event) => { if (state.contextMenu && !
 
 async function start() {
   state.folders = configuredFolders.map((path) => ({ path, label: folderLabel(path) }));
+  invoke('platform_name').then((name) => { platformName = name; }).catch(() => {});
+  resolveResource('icons/32x32.png').then((path) => { dragIconPath = path; }).catch((error) => console.error('resolveResource failed', error));
+  setupExternalDragDrop();
   const drives = await loadDrives();
   const savedPanes = Array.isArray(session.panes) ? session.panes : [];
   for (let index = 0; index < state.panes.length; index += 1) {

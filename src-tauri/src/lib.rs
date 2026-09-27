@@ -2,7 +2,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -179,6 +179,192 @@ fn rename_entry(path: String, new_name: String) -> Result<(), String> {
 #[tauri::command]
 fn delete_entry(path: String) -> Result<(), String> {
     trash::delete(&path).map_err(|error| error.to_string())
+}
+
+fn unused_name(dir: &Path, stem: &str, extension: &str) -> PathBuf {
+    let mut candidate = dir.join(format!("{stem}{extension}"));
+    let mut attempt = 2u32;
+    while candidate.exists() {
+        candidate = dir.join(format!("{stem} {attempt}{extension}"));
+        attempt += 1;
+    }
+    candidate
+}
+
+#[tauri::command]
+fn create_file(dest_dir: String) -> Result<String, String> {
+    let candidate = unused_name(Path::new(&dest_dir), "New File", ".txt");
+    fs::File::create(&candidate).map_err(|error| error.to_string())?;
+    Ok(candidate.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn create_folder(dest_dir: String) -> Result<String, String> {
+    let candidate = unused_name(Path::new(&dest_dir), "New Folder", "");
+    fs::create_dir(&candidate).map_err(|error| error.to_string())?;
+    Ok(candidate.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn platform_name() -> &'static str {
+    std::env::consts::OS
+}
+
+#[tauri::command]
+fn edit_in_text_editor(paths: Vec<String>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        for path in &paths {
+            std::process::Command::new("notepad.exe").arg(path).spawn().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for path in &paths {
+            std::process::Command::new("open").args(["-a", "TextEdit", path]).spawn().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = paths;
+        Err("Editing in a text editor is not supported on this platform".to_string())
+    }
+}
+
+#[tauri::command]
+fn show_properties(paths: Vec<String>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win_properties::show(&paths)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = paths;
+        Err("The properties dialog is only available on Windows".to_string())
+    }
+}
+
+// Opens Explorer's own Properties dialog: a single item goes through the "properties" shell verb,
+// several items through SHMultiFileProperties, which shows the combined "N files" sheet Explorer does.
+#[cfg(windows)]
+mod win_properties {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+
+    const SEE_MASK_INVOKEIDLIST: u32 = 0x0000_000C;
+    const SW_SHOW: i32 = 5;
+
+    #[repr(C)]
+    struct ShellExecuteInfoW {
+        cb_size: u32,
+        f_mask: u32,
+        hwnd: isize,
+        lp_verb: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show: i32,
+        h_inst_app: isize,
+        lp_id_list: *mut c_void,
+        lp_class: *const u16,
+        hkey_class: isize,
+        dw_hot_key: u32,
+        h_icon_or_monitor: isize,
+        h_process: isize,
+    }
+
+    #[repr(C)]
+    struct Guid(u32, u16, u16, [u8; 8]);
+    const IID_IDATAOBJECT: Guid = Guid(0x0000_010e, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
+        fn SHParseDisplayName(name: *const u16, bind_ctx: *mut c_void, pidl: *mut *mut c_void, sfgao_in: u32, sfgao_out: *mut u32) -> i32;
+        fn SHCreateDataObject(pidl_folder: *const c_void, count: u32, pidls: *const *mut c_void, inner: *mut c_void, riid: *const Guid, out: *mut *mut c_void) -> i32;
+        fn SHMultiFileProperties(data_object: *mut c_void, flags: u32) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(ptr: *mut c_void);
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    pub fn show(paths: &[String]) -> Result<(), String> {
+        match paths {
+            [] => Ok(()),
+            [path] => show_single(path),
+            _ => show_multiple(paths),
+        }
+    }
+
+    fn show_single(path: &str) -> Result<(), String> {
+        let verb = wide("properties");
+        let file = wide(path);
+        let mut info = ShellExecuteInfoW {
+            cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+            f_mask: SEE_MASK_INVOKEIDLIST,
+            hwnd: 0,
+            lp_verb: verb.as_ptr(),
+            lp_file: file.as_ptr(),
+            lp_parameters: std::ptr::null(),
+            lp_directory: std::ptr::null(),
+            n_show: SW_SHOW,
+            h_inst_app: 0,
+            lp_id_list: std::ptr::null_mut(),
+            lp_class: std::ptr::null(),
+            hkey_class: 0,
+            dw_hot_key: 0,
+            h_icon_or_monitor: 0,
+            h_process: 0,
+        };
+        if unsafe { ShellExecuteExW(&mut info) } == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+
+    fn show_multiple(paths: &[String]) -> Result<(), String> {
+        let mut pidls: Vec<*mut c_void> = Vec::with_capacity(paths.len());
+        let result = (|| {
+            for path in paths {
+                let mut pidl = std::ptr::null_mut();
+                let hr = unsafe { SHParseDisplayName(wide(path).as_ptr(), std::ptr::null_mut(), &mut pidl, 0, std::ptr::null_mut()) };
+                if hr < 0 {
+                    return Err(format!("Couldn't resolve {path} (HRESULT {hr:#x})"));
+                }
+                pidls.push(pidl);
+            }
+            // With no parent folder, the absolute item IDs are taken relative to the desktop.
+            let mut data_object = std::ptr::null_mut();
+            let hr = unsafe { SHCreateDataObject(std::ptr::null(), pidls.len() as u32, pidls.as_ptr(), std::ptr::null_mut(), &IID_IDATAOBJECT, &mut data_object) };
+            if hr < 0 {
+                return Err(format!("SHCreateDataObject failed (HRESULT {hr:#x})"));
+            }
+            let hr = unsafe { SHMultiFileProperties(data_object, 0) };
+            unsafe { release(data_object) };
+            if hr < 0 {
+                return Err(format!("SHMultiFileProperties failed (HRESULT {hr:#x})"));
+            }
+            Ok(())
+        })();
+        for pidl in pidls {
+            unsafe { CoTaskMemFree(pidl) };
+        }
+        result
+    }
+
+    // IUnknown::Release is the third vtable slot of every COM interface.
+    unsafe fn release(object: *mut c_void) {
+        let vtable = *(object as *const *const usize);
+        let release: extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtable.add(2));
+        release(object);
+    }
 }
 
 // Copies the OS clipboard's file-list format (CF_HDROP) plus the "Preferred DropEffect" format
@@ -484,6 +670,13 @@ fn merge_dir_recursive(source: &Path, dest: &Path, cut: bool, resolution: Confli
     Ok(())
 }
 
+fn is_same_or_inside(path: &Path, ancestor: &Path) -> bool {
+    match (fs::canonicalize(path), fs::canonicalize(ancestor)) {
+        (Ok(path), Ok(ancestor)) => path.starts_with(ancestor),
+        _ => false,
+    }
+}
+
 #[tauri::command]
 fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool, conflict_resolution: Option<String>) -> Result<Vec<String>, String> {
     let resolution = if conflict_resolution.as_deref() == Some("replace") { ConflictResolution::Replace } else { ConflictResolution::Skip };
@@ -495,6 +688,10 @@ fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool, conflict_resol
         if cut && source.parent() == Some(dest) {
             // Cutting and pasting back into the same folder is a no-op, like Explorer.
             results.push(source_path);
+            continue;
+        }
+        if is_same_or_inside(dest, source) {
+            // A folder can't go into itself or one of its own subfolders (e.g. dropped onto its own row).
             continue;
         }
         let existing_target = dest.join(&name);
@@ -552,6 +749,51 @@ mod paste_entries_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn create_file_uses_default_name_when_folder_is_empty() {
+        let sandbox = Sandbox::new("create-file-empty");
+        let path = create_file(sandbox.dir.to_string_lossy().to_string()).unwrap();
+        assert_eq!(path, sandbox.path("New File.txt").to_string_lossy().to_string());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn create_file_numbers_subsequent_files() {
+        let sandbox = Sandbox::new("create-file-numbered");
+        fs::write(sandbox.path("New File.txt"), b"existing").unwrap();
+        let path = create_file(sandbox.dir.to_string_lossy().to_string()).unwrap();
+        assert_eq!(path, sandbox.path("New File 2.txt").to_string_lossy().to_string());
+        fs::write(sandbox.path("New File 2.txt"), b"existing too").unwrap();
+        let path = create_file(sandbox.dir.to_string_lossy().to_string()).unwrap();
+        assert_eq!(path, sandbox.path("New File 3.txt").to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn create_folder_numbers_subsequent_folders() {
+        let sandbox = Sandbox::new("create-folder-numbered");
+        let path = create_folder(sandbox.dir.to_string_lossy().to_string()).unwrap();
+        assert_eq!(path, sandbox.path("New Folder").to_string_lossy().to_string());
+        assert!(Path::new(&path).is_dir());
+        let path = create_folder(sandbox.dir.to_string_lossy().to_string()).unwrap();
+        assert_eq!(path, sandbox.path("New Folder 2").to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn paste_skips_folder_into_itself_or_its_subfolder() {
+        let sandbox = Sandbox::new("paste-into-self");
+        fs::create_dir_all(sandbox.path("a").join("sub")).unwrap();
+        let source = sandbox.path("a").to_string_lossy().to_string();
+        for cut in [false, true] {
+            for dest in [sandbox.path("a"), sandbox.path("a").join("sub")] {
+                let result = paste_entries(vec![source.clone()], dest.to_string_lossy().to_string(), cut, None).unwrap();
+                assert!(result.is_empty());
+            }
+        }
+        assert!(sandbox.path("a").join("sub").is_dir());
+        assert!(!sandbox.path("a").join("a").exists());
+        assert!(!sandbox.path("a").join("sub").join("a").exists());
     }
 
     #[test]
@@ -1022,13 +1264,14 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_drag::init())
         .manage(WatcherState::default())
         .manage(TreeState::default())
         .manage(IconCacheState::default());
     #[cfg(not(windows))]
     let builder = builder.manage(ClipboardState::default());
     builder
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, edit_in_text_editor, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove");
 }
