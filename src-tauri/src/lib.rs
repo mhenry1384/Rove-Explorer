@@ -178,7 +178,29 @@ fn rename_entry(path: String, new_name: String) -> Result<(), String> {
 
 #[tauri::command]
 fn delete_entry(path: String) -> Result<(), String> {
-    trash::delete(&path).map_err(readable_trash_error)
+    trash::delete(&path).map_err(readable_trash_error)?;
+    // The shell recycles silently: an item that is in use is skipped yet the operation still
+    // reports success, so check what is left behind. Whatever survived inside a folder is what
+    // the other program has open (everything else already went to the Recycle Bin).
+    let target = Path::new(&path);
+    if !target.exists() { return Ok(()); }
+    let mut remaining = Vec::new();
+    if target.is_dir() { collect_files(target, target, &mut remaining); }
+    if remaining.is_empty() {
+        return Err("It is being used by another program.".to_string());
+    }
+    let shown = remaining.iter().take(5).map(|name| format!("  {name}")).collect::<Vec<_>>().join("\n");
+    let more = if remaining.len() > 5 { format!("\n  ...and {} more", remaining.len() - 5) } else { String::new() };
+    Err(format!("These items inside it are being used by another program:\n{shown}{more}"))
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() { collect_files(root, &path, out); continue; }
+        out.push(path.strip_prefix(root).unwrap_or(&path).display().to_string());
+    }
 }
 
 // trash reports Windows failures as "windows error: <message> (0x8007....)"; keep just the message
@@ -761,6 +783,21 @@ mod paste_entries_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delete_entry_reports_files_in_use() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let sandbox = Sandbox::new("delete-in-use");
+        let folder = sandbox.path("pix");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("photo.jpg"), b"x").unwrap();
+        let lock = fs::OpenOptions::new().read(true).share_mode(0).open(folder.join("photo.jpg")).unwrap();
+        let error = delete_entry(folder.to_string_lossy().to_string()).unwrap_err();
+        drop(lock);
+        assert!(folder.exists());
+        assert!(error.contains("being used by another program") && error.contains("photo.jpg"), "{error}");
     }
 
     #[test]
