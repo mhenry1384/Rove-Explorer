@@ -178,7 +178,19 @@ fn rename_entry(path: String, new_name: String) -> Result<(), String> {
 
 #[tauri::command]
 fn delete_entry(path: String) -> Result<(), String> {
-    trash::delete(&path).map_err(|error| error.to_string())
+    trash::delete(&path).map_err(readable_trash_error)
+}
+
+// trash reports Windows failures as "windows error: <message> (0x8007....)"; keep just the message
+// so it can be shown to the user (e.g. "...being used by another process.").
+fn readable_trash_error(error: trash::Error) -> String {
+    let text = match error {
+        trash::Error::Os { description, .. } | trash::Error::Unknown { description } => description,
+        other => other.to_string(),
+    };
+    let text = text.strip_prefix("windows error: ").unwrap_or(&text);
+    let text = match text.rfind(" (0x") { Some(index) if text.ends_with(')') => &text[..index], _ => text };
+    text.trim().to_string()
 }
 
 fn unused_name(dir: &Path, stem: &str, extension: &str) -> PathBuf {

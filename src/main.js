@@ -4,7 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { homeDir, sep, resolveResource } from '@tauri-apps/api/path';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { openPath } from '@tauri-apps/plugin-opener';
-import { ask } from '@tauri-apps/plugin-dialog';
+import { ask, message } from '@tauri-apps/plugin-dialog';
 import { startDrag } from '@crabnebula/tauri-plugin-drag';
 import configuredFolders from '../config/folders.json';
 import { version as APP_VERSION } from '../package.json';
@@ -128,7 +128,13 @@ function render() {
   const moveButton = `<button class="nav-history-button move-button" data-move-to-other-pane title="${escapeAttribute(moveTitle)}" aria-label="Move selected items to the other pane" ${canMoveToOtherPane() ? '' : 'disabled'}>${moveIcon}</button><span class="toolbar-separator" aria-hidden="true"></span>`;
   const scrollPositions = new Map();
   document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); if (scrollable) scrollPositions.set(el.dataset.pane, scrollable.scrollTop); });
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><span class="version-tag">v${APP_VERSION}</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
+  // Re-rendering replaces the rename box (e.g. when a file-watcher refresh lands right after New Folder),
+  // so carry its focus, typed text and cursor position over to the new one.
+  const oldRename = document.querySelector('[data-rename]');
+  const renameSnapshot = oldRename && { value: oldRename.value, start: oldRename.selectionStart, end: oldRename.selectionEnd, focused: document.activeElement === oldRename };
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><span class="version-tag">v${APP_VERSION}</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>F2</kbd> rename <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
+  const newRename = renameSnapshot && document.querySelector('[data-rename]');
+  if (newRename) { newRename.value = renameSnapshot.value; if (renameSnapshot.focused) { newRename.focus(); newRename.setSelectionRange(renameSnapshot.start, renameSnapshot.end); } }
   bindEvents();
   document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); const saved = scrollPositions.get(el.dataset.pane); if (scrollable && saved) scrollable.scrollTop = saved; });
   if (scrollSelectionIntoView) {
@@ -323,16 +329,26 @@ async function deleteEntries(index, entries) {
   const targets = entries.filter((entry) => entry && entry.kind !== 'drive');
   if (!targets.length) return;
   const pane = state.panes[index]; const tab = currentTab(pane);
+  const failures = [];
   for (const entry of targets) {
-    await invoke('delete_entry', { path: entry.path });
+    try { await invoke('delete_entry', { path: entry.path }); } catch (error) { failures.push({ name: entry.name, error }); }
   }
-  const deletedIds = new Set(targets.map((entry) => entry.id));
+  const failedIds = new Set(targets.filter((entry) => failures.some((failure) => failure.name === entry.name)).map((entry) => entry.id));
+  const deletedIds = new Set(targets.map((entry) => entry.id).filter((id) => !failedIds.has(id)));
   tab.entries = await load(tab.path);
   tab.selected = (tab.selected || []).filter((id) => !deletedIds.has(id));
   if (deletedIds.has(tab.focusId)) tab.focusId = null;
   if (deletedIds.has(tab.anchorId)) tab.anchorId = tab.focusId;
   state.contextMenu = null;
   saveSession(); render();
+  if (failures.length) await showDeleteFailures(failures);
+}
+
+async function showDeleteFailures(failures) {
+  const details = failures.map(({ name, error }) => `${name}: ${error}`).join('\n\n');
+  const intro = failures.length === 1 ? `Couldn't delete "${failures[0].name}".` : `Couldn't delete ${failures.length} items.`;
+  const hint = failures.some(({ error }) => /used by another process|being used|locked/i.test(String(error))) ? '\n\nA file is open in another program. Close it and try again.' : '';
+  await message(`${intro}\n\n${details}${hint}`, { title: 'Delete failed', kind: 'error' });
 }
 
 function deleteSelected(index) {
@@ -583,7 +599,7 @@ function removeTreeNode(node, targetPath) {
 async function deleteTreeNode(index, path) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.treeState?.tree || path === tab.treeState.tree.path) return;
-  await invoke('delete_entry', { path });
+  try { await invoke('delete_entry', { path }); } catch (error) { state.contextMenu = null; render(); await showDeleteFailures([{ name: path.split(/[\\/]/).pop(), error }]); return; }
   removeTreeNode(tab.treeState.tree, path);
   if (tab.treeState.selected === path) tab.treeState.selected = null;
   state.contextMenu = null;
@@ -852,6 +868,12 @@ document.addEventListener('keydown', (event) => {
   if (event.altKey && event.key === 'ArrowLeft') { event.preventDefault(); goBack(state.activePane); return; }
   if (event.altKey && event.key === 'ArrowRight') { event.preventDefault(); goForward(state.activePane); return; }
   if (isTyping) return;
+  if (event.key === 'F2') {
+    event.preventDefault();
+    const entry = tab?.view !== 'tree' && tab?.entries.find((item) => item.id === tab.focusId);
+    if (entry && entry.kind !== 'drive') { clearTimeout(entryClickTimer); startRename(state.activePane, entry); }
+    return;
+  }
   if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveSelection(state.activePane, event.key === 'ArrowUp' ? -1 : 1, event.shiftKey); return; }
   if ((event.key === 'Home' || event.key === 'End') && tab?.view !== 'tree') { event.preventDefault(); moveSelection(state.activePane, event.key === 'Home' ? -Infinity : Infinity, event.shiftKey); return; }
   if (event.key === 'Enter' && tab?.view === 'tree') { event.preventDefault(); if (tab.treeState?.selected) openTreeNodeInDetails(state.activePane, tab.treeState.selected); return; }
