@@ -1,4 +1,4 @@
-# Rove
+# Rove Explorer
 
 A focused, dual-pane file explorer built with [Tauri](https://tauri.app) (Rust) and vanilla JavaScript.
 

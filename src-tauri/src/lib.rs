@@ -381,7 +381,7 @@ mod win_properties {
 
 // Copies the OS clipboard's file-list format (CF_HDROP) plus the "Preferred DropEffect" format
 // that Explorer uses to mark a copy vs. a cut, so cutting/copying here is interchangeable with
-// Explorer: paths copied in Rove can be pasted in Explorer and vice versa.
+// Explorer: paths copied in Rove Explorer can be pasted in Explorer and vice versa.
 #[cfg(windows)]
 mod win_clipboard {
     use std::ffi::OsStr;
@@ -747,7 +747,7 @@ mod paste_entries_tests {
 
     impl Sandbox {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("rove-test-{name}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("rove-explorer-test-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Sandbox { dir }
@@ -1285,5 +1285,5 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, edit_in_text_editor, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
-        .expect("error while running Rove");
+        .expect("error while running Rove Explorer");
 }

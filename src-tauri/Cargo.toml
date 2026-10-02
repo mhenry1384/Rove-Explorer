@@ -1,12 +1,12 @@
 [package]
-name = "rove"
+name = "rove-explorer"
 version = "0.4.0"
 description = "A focused two-pane file explorer"
-authors = ["Rove"]
+authors = ["Rove Explorer"]
 edition = "2021"
 
 [lib]
-name = "rove_lib"
+name = "rove_explorer_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -13,8 +13,8 @@ const SEP = sep();
 const isWindows = SEP === '\\';
 const COMPUTER_LABEL = isWindows ? 'This PC' : 'This Mac';
 const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], contextMenu: null, clipboard: null };
-const stored = JSON.parse(localStorage.getItem('rove-state') || '{}');
-const session = JSON.parse(localStorage.getItem('rove-session') || '{}');
+const stored = JSON.parse(localStorage.getItem('rove-explorer-state') || '{}');
+const session = JSON.parse(localStorage.getItem('rove-explorer-session') || '{}');
 const DOUBLE_CLICK_MS = 400;
 const VIEW_MODES = [
   { id: 'details', label: 'Details', icon: '<path d="M2 3.5h12M2 8h12M2 12.5h12"/>' },
@@ -87,7 +87,7 @@ function formatBytes(bytes) {
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
-function remember(path, name) { stored[path] = { name, time: Date.now() }; localStorage.setItem('rove-state', JSON.stringify(stored)); }
+function remember(path, name) { stored[path] = { name, time: Date.now() }; localStorage.setItem('rove-explorer-state', JSON.stringify(stored)); }
 function firstEntryId(entries) { return entries[0]?.id || null; }
 function toSelection(id) { return id ? [id] : []; }
 function rememberedOrFirst(entries, rememberedName) { const remembered = rememberedName && entries.find((entry) => entry.name === rememberedName); return toSelection(remembered ? remembered.id : firstEntryId(entries)); }
@@ -104,7 +104,7 @@ function selectRange(tab, entries, anchorId, focusId) {
   tab.focusId = focusId;
   tab.anchorId = anchorId;
 }
-function saveSession() { localStorage.setItem('rove-session', JSON.stringify({ panes: state.panes.map((pane) => ({ activeTab: pane.activeTab, tabs: pane.tabs.map(({ path, label, selected }) => ({ path, label, selected })) })) })); }
+function saveSession() { localStorage.setItem('rove-explorer-session', JSON.stringify({ panes: state.panes.map((pane) => ({ activeTab: pane.activeTab, tabs: pane.tabs.map(({ path, label, selected }) => ({ path, label, selected })) })) })); }
 function isEditing(index, entry) { return state.editing?.pane === index && state.editing.entryId === entry.id; }
 
 async function load(path) {
@@ -132,7 +132,7 @@ function render() {
   // so carry its focus, typed text and cursor position over to the new one.
   const oldRename = document.querySelector('[data-rename]');
   const renameSnapshot = oldRename && { value: oldRename.value, start: oldRename.selectionStart, end: oldRename.selectionEnd, focused: document.activeElement === oldRename };
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><span class="version-tag">v${APP_VERSION}</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>F2</kbd> rename <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>F2</kbd> rename <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
   const newRename = renameSnapshot && document.querySelector('[data-rename]');
   if (newRename) { newRename.value = renameSnapshot.value; if (renameSnapshot.focused) { newRename.focus(); newRename.setSelectionRange(renameSnapshot.start, renameSnapshot.end); } }
   bindEvents();
