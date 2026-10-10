@@ -1,6 +1,6 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,8 @@ use tauri::{AppHandle, Emitter, State};
 #[derive(Default)]
 struct WatcherState {
     watcher: Mutex<Option<RecommendedWatcher>>,
-    watched: Mutex<HashSet<String>>,
+    // Watched path -> whether it is watched recursively (tree view needs changes from every subfolder).
+    watched: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Default)]
@@ -984,7 +985,7 @@ mod paste_entries_tests {
 }
 
 #[tauri::command]
-fn set_watched_paths(app: AppHandle, state: State<WatcherState>, paths: Vec<String>) -> Result<(), String> {
+fn set_watched_paths(app: AppHandle, state: State<WatcherState>, paths: Vec<String>, recursive_paths: Vec<String>) -> Result<(), String> {
     let mut watcher_guard = state.watcher.lock().map_err(|_| "watcher lock poisoned".to_string())?;
     if watcher_guard.is_none() {
         let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
@@ -1003,15 +1004,20 @@ fn set_watched_paths(app: AppHandle, state: State<WatcherState>, paths: Vec<Stri
     }
     let watcher = watcher_guard.as_mut().unwrap();
     let mut watched = state.watched.lock().map_err(|_| "watched lock poisoned".to_string())?;
-    let desired: HashSet<String> = paths.into_iter().collect();
-    for old in watched.iter() {
-        if !desired.contains(old) {
+    // A path asked for both ways (one pane in tree view, the other not) is watched recursively, which covers both.
+    let mut desired: HashMap<String, bool> = paths.into_iter().map(|path| (path, false)).collect();
+    for path in recursive_paths {
+        desired.insert(path, true);
+    }
+    for (old, old_recursive) in watched.iter() {
+        if desired.get(old) != Some(old_recursive) {
             let _ = watcher.unwatch(Path::new(old));
         }
     }
-    for new in desired.iter() {
-        if !watched.contains(new) {
-            let _ = watcher.watch(Path::new(new), RecursiveMode::NonRecursive);
+    for (new, recursive) in desired.iter() {
+        if watched.get(new) != Some(recursive) {
+            let mode = if *recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
+            let _ = watcher.watch(Path::new(new), mode);
         }
     }
     *watched = desired;

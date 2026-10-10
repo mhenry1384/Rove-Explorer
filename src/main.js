@@ -87,7 +87,18 @@ function formatBytes(bytes) {
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
-function remember(path, name) { stored[path] = { name, time: Date.now() }; localStorage.setItem('rove-explorer-state', JSON.stringify(stored)); }
+function persistStored() { localStorage.setItem('rove-explorer-state', JSON.stringify(stored)); }
+function remember(path, name) { stored[path] = { ...stored[path], name, time: Date.now() }; persistStored(); }
+// Scroll events fire rapidly, so the in-memory value updates immediately and the write to storage is debounced.
+let scrollPersistTimer = null;
+// Positions are kept per view because Details rows and Thumbnail cards scroll to different offsets.
+function rememberedScroll(path, view) { return stored[path]?.scroll?.[view]; }
+function rememberScroll(path, view, scrollTop) {
+  if (!path || rememberedScroll(path, view) === scrollTop) return;
+  stored[path] = { ...stored[path], scroll: { ...stored[path]?.scroll, [view]: scrollTop }, time: Date.now() };
+  clearTimeout(scrollPersistTimer);
+  scrollPersistTimer = setTimeout(persistStored, 300);
+}
 function firstEntryId(entries) { return entries[0]?.id || null; }
 function toSelection(id) { return id ? [id] : []; }
 function rememberedOrFirst(entries, rememberedName) { const remembered = rememberedName && entries.find((entry) => entry.name === rememberedName); return toSelection(remembered ? remembered.id : firstEntryId(entries)); }
@@ -127,7 +138,7 @@ function render() {
   const moveTitle = canMoveToOtherPane() ? `Move selected items to ${currentTab(state.panes[otherPane]).path}` : 'Move selected items to the other pane';
   const moveButton = `<button class="nav-history-button move-button" data-move-to-other-pane title="${escapeAttribute(moveTitle)}" aria-label="Move selected items to the other pane" ${canMoveToOtherPane() ? '' : 'disabled'}>${moveIcon}</button><span class="toolbar-separator" aria-hidden="true"></span>`;
   const scrollPositions = new Map();
-  document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); if (scrollable) scrollPositions.set(el.dataset.pane, scrollable.scrollTop); });
+  document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); if (scrollable) scrollPositions.set(el.dataset.pane, { key: scrollable.dataset.scrollKey, top: scrollable.scrollTop }); });
   // Re-rendering replaces the rename box (e.g. when a file-watcher refresh lands right after New Folder),
   // so carry its focus, typed text and cursor position over to the new one.
   const oldRename = document.querySelector('[data-rename]');
@@ -136,7 +147,23 @@ function render() {
   const newRename = renameSnapshot && document.querySelector('[data-rename]');
   if (newRename) { newRename.value = renameSnapshot.value; if (renameSnapshot.focused) { newRename.focus(); newRename.setSelectionRange(renameSnapshot.start, renameSnapshot.end); } }
   bindEvents();
-  document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); const saved = scrollPositions.get(el.dataset.pane); if (scrollable && saved) scrollable.scrollTop = saved; });
+  document.querySelectorAll('.pane').forEach((el) => {
+    const scrollable = el.querySelector('.table-wrap');
+    if (!scrollable) return;
+    const previous = scrollPositions.get(el.dataset.pane);
+    const folderPath = scrollable.dataset.scrollPath;
+    if (previous?.key === scrollable.dataset.scrollKey) {
+      // Same folder and view as before this render: keep where the user was.
+      scrollable.scrollTop = previous.top;
+    } else {
+      // A different folder (or view) is now showing: restore that folder's remembered position,
+      // or bring the remembered selection into view if the folder has none yet.
+      const savedTop = folderPath ? rememberedScroll(folderPath, scrollable.dataset.scrollView) : undefined;
+      if (savedTop !== undefined) scrollable.scrollTop = savedTop;
+      else el.querySelector('.file-row.focused, .thumb-card.focused')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+    if (folderPath) scrollable.addEventListener('scroll', () => rememberScroll(folderPath, scrollable.dataset.scrollView, scrollable.scrollTop), { passive: true });
+  });
   if (scrollSelectionIntoView) {
     const selectedRow = document.querySelector(`.pane[data-pane="${state.activePane}"] .file-row.focused, .pane[data-pane="${state.activePane}"] .thumb-card.focused`);
     selectedRow?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -146,12 +173,59 @@ function render() {
 }
 
 function syncWatchedPaths() {
-  const paths = [...new Set(state.panes.map((pane) => currentTab(pane)?.path).filter(Boolean))];
-  const key = [...paths].sort().join('|');
+  const visibleTabs = state.panes.map(currentTab).filter((tab) => tab?.path);
+  const paths = [...new Set(visibleTabs.map((tab) => tab.path))];
+  // Tree view totals cover every subfolder, so those roots are watched recursively.
+  const recursivePaths = [...new Set(visibleTabs.filter((tab) => tab.view === 'tree').map((tab) => tab.path))];
+  const key = `${[...paths].sort().join('|')}#${[...recursivePaths].sort().join('|')}`;
   if (key === lastWatchedKey) return;
   lastWatchedKey = key;
-  invoke('set_watched_paths', { paths }).catch((error) => console.error('set_watched_paths failed', error));
+  invoke('set_watched_paths', { paths, recursivePaths }).catch((error) => console.error('set_watched_paths failed', error));
 }
+
+// Tree view rescans automatically when anything under its root changes, but never sooner than
+// TREE_RESCAN_INTERVAL_MS after the previous scan finished (scans of big trees are expensive).
+const TREE_RESCAN_INTERVAL_MS = 15000;
+const TREE_RESCAN_SETTLE_MS = 1000;
+function isWithin(changedPath, rootPath) {
+  const changed = normalizePath(changedPath); const root = normalizePath(rootPath);
+  return changed === root || changed.startsWith(`${root}/`);
+}
+
+function scheduleTreeRescans(changedPath) {
+  state.panes.forEach((pane, index) => {
+    const tab = currentTab(pane);
+    if (tab?.view === 'tree' && tab.treeState && tab.path && isWithin(changedPath, tab.path)) scheduleTreeRescan(index, tab.treeState);
+  });
+}
+
+function scheduleTreeRescan(index, treeState) {
+  // A change during a scan may or may not have been seen by it, so rescan once it finishes.
+  if (treeState.status === 'loading' || treeState.rescanning) { treeState.dirty = true; return; }
+  if (treeState.status !== 'done' || treeState.rescanTimer) return;
+  const sinceLastScan = Date.now() - (treeState.lastScanEnd || 0);
+  const delay = Math.max(TREE_RESCAN_SETTLE_MS, TREE_RESCAN_INTERVAL_MS - sinceLastScan);
+  treeState.rescanTimer = setTimeout(() => {
+    treeState.rescanTimer = null;
+    const tab = currentTab(state.panes[index]);
+    // Skip if the pane has since moved on to another folder, view or tab.
+    if (tab?.treeState !== treeState || tab.view !== 'tree') return;
+    rescanTree(tab);
+  }, delay);
+}
+
+// Unlike startTreeView, keeps showing the current tree (and its expanded folders and selection)
+// until the new scan arrives.
+function rescanTree(tab) {
+  const treeState = tab.treeState;
+  const requestId = `tree-rescan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  treeState.requestId = requestId; treeState.rescanning = true; treeState.dirty = false;
+  invoke('compute_tree_stats', { requestId, path: tab.path }).catch(() => {
+    if (treeState.requestId === requestId) treeState.rescanning = false;
+  });
+}
+
+function treeContains(node, path) { return node.path === path || node.children.some((child) => treeContains(child, path)); }
 
 function scheduleFolderReload(changedPath) {
   const key = normalizePath(changedPath);
@@ -252,11 +326,15 @@ function renderPane(pane, index) {
   const breadcrumb = tab?.path
     ? pathSegments(tab.path).map((segment, segIndex) => `${segIndex > 0 ? '<span class="path-sep">/</span>' : ''}<button class="path-segment" data-breadcrumb="${escapeAttribute(segment.path)}">${escapeAttribute(segment.label)}</button>`).join('')
     : `<span class="path-segment path-segment-static">${COMPUTER_LABEL}</span>`;
+  // The scroll key tells render() whether this is still the same listing; the scroll path is where a folder listing's position is remembered.
+  const scrollKey = escapeAttribute(`${view}|${tab?.path ?? ''}`);
+  const scrollPath = tab?.path && view !== 'tree' ? ` data-scroll-path="${escapeAttribute(tab.path)}"` : '';
+  const scrollAttrs = `data-scroll-key="${scrollKey}" data-scroll-view="${view}"${scrollPath}`;
   const body = view === 'tree'
-    ? `<div class="table-wrap tree-wrap">${renderTreeBody(tab)}</div>`
+    ? `<div class="table-wrap tree-wrap" ${scrollAttrs}>${renderTreeBody(tab)}</div>`
     : view === 'thumbnails'
-      ? `<div class="table-wrap thumb-wrap">${renderThumbnails(entries, selected, focusId, index)}</div>`
-      : `<div class="table-wrap"><div class="table-head ${isDriveRoot ? 'drive-head' : ''}">${headers}</div><div class="rows">${rows}</div></div>`;
+      ? `<div class="table-wrap thumb-wrap" ${scrollAttrs}>${renderThumbnails(entries, selected, focusId, index)}</div>`
+      : `<div class="table-wrap" ${scrollAttrs}><div class="table-head ${isDriveRoot ? 'drive-head' : ''}">${headers}</div><div class="rows">${rows}</div></div>`;
   const viewSelect = tab?.path ? `<div class="view-switch" role="group" aria-label="Pane view"><span class="view-label">${VIEW_MODES.find((mode) => mode.id === view)?.label ?? ''}</span>${VIEW_MODES.map((mode) => `<button class="view-button ${mode.id === view ? 'active' : ''}" data-view-mode="${mode.id}" title="${mode.label}" aria-label="${mode.label}" aria-pressed="${mode.id === view}"><svg viewBox="0 0 16 16" aria-hidden="true">${mode.icon}</svg></button>`).join('')}</div>` : '';
   return `<article class="pane ${state.activePane === index ? 'is-active' : ''}" data-pane="${index}"><div class="tabs">${pane.tabs.map((item, tabIndex) => `<button class="tab ${tabIndex === pane.activeTab ? 'active' : ''}" data-tab="${tabIndex}"><span class="tab-dot"></span>${item.label}<span class="tab-close">×</span></button>`).join('')}<button class="new-tab" data-new-tab title="New tab">＋</button></div><div class="pathbar"><button class="nav-button" data-up title="Go up one level" aria-label="Go up one level">↑</button><div class="path-text">${breadcrumb}</div><span class="item-count">${entries.length} ITEMS</span></div>${body}<div class="pane-footer"><span class="selection-label">${selected.length ? `${selected.length} SELECTED` : 'NOTHING SELECTED'}</span>${viewSelect}</div></article>`;
 }
@@ -762,7 +840,8 @@ function bindEvents() {
       // scroll/pan. Act on pointerdown for real pointer input, and keep `click` only as a
       // fallback for keyboard-triggered activation (Tab + Enter/Space), which never fires pointerdown.
       row.addEventListener('pointerdown', (event) => {
-        if (event.button !== 0) return;
+        // Let clicks inside the rename box place the cursor instead of re-selecting the row.
+        if (event.button !== 0 || event.target.closest('[data-rename]')) return;
         // Prevent the browser's default focus-on-mousedown behavior: focusing the button
         // inside the scrollable list triggers a native scroll-into-view, which is what was
         // causing the clicked row to jump to the bottom of the pane.
@@ -772,6 +851,9 @@ function bindEvents() {
       });
       row.addEventListener('click', (event) => {
         if (suppressNextClick) { suppressNextClick = false; return; }
+        // The rename box sits inside the row's <button>, so typing a space in it makes the browser
+        // "press" the row; that click would otherwise schedule a fresh startRename mid-typing.
+        if (state.editing) return;
         activate(event);
       });
       row.addEventListener('contextmenu', (event) => {
@@ -837,7 +919,7 @@ function bindEvents() {
   locationInput.addEventListener('mouseup', (event) => { if (justFocusedLocation) event.preventDefault(); justFocusedLocation = false; });
   locationInput.addEventListener('blur', () => { justFocusedLocation = false; });
   locationInput.addEventListener('keydown', (event) => { if (event.key !== 'Enter') return; event.preventDefault(); const input = event.currentTarget; navigatePath(input.value).catch(() => input.select()); });
-  const renameInput = document.querySelector('[data-rename]'); renameInput?.addEventListener('click', (event) => event.stopPropagation()); renameInput?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelRename(); } if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); } }); renameInput?.addEventListener('blur', (event) => { const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); if (entry) finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); });
+  const renameInput = document.querySelector('[data-rename]'); renameInput?.addEventListener('click', (event) => event.stopPropagation()); renameInput?.addEventListener('keyup', (event) => { if (event.key === ' ') event.preventDefault(); /* else releasing Space "presses" the row button the box sits in */ }); renameInput?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelRename(); } if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); } }); renameInput?.addEventListener('blur', (event) => { const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); if (entry) finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); });
   const contextMenu = document.querySelector('[data-context-menu]');
   contextMenu?.addEventListener('click', (event) => event.stopPropagation());
   contextMenu?.addEventListener('contextmenu', (event) => event.preventDefault());
@@ -936,7 +1018,7 @@ async function start() {
 }
 
 start().catch(() => render());
-listen('fs-changed', (event) => scheduleFolderReload(event.payload));
+listen('fs-changed', (event) => { scheduleFolderReload(event.payload); scheduleTreeRescans(event.payload); });
 listen('tree-progress', (event) => {
   const tab = findTabByTreeRequest(event.payload.requestId);
   if (!tab || tab.treeState.status !== 'loading') return;
@@ -947,7 +1029,16 @@ listen('tree-progress', (event) => {
 listen('tree-done', (event) => {
   const tab = findTabByTreeRequest(event.payload.requestId);
   if (!tab) return;
-  tab.treeState.status = 'done';
-  tab.treeState.tree = event.payload.tree;
+  const treeState = tab.treeState;
+  treeState.status = 'done';
+  treeState.tree = event.payload.tree;
+  treeState.rescanning = false;
+  treeState.lastScanEnd = Date.now();
+  if (treeState.selected && !treeContains(treeState.tree, treeState.selected)) treeState.selected = null;
+  if (treeState.dirty) {
+    treeState.dirty = false;
+    const paneIndex = state.panes.findIndex((pane) => currentTab(pane) === tab);
+    if (paneIndex !== -1) scheduleTreeRescan(paneIndex, treeState);
+  }
   render();
 });
