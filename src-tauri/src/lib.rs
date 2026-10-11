@@ -173,8 +173,24 @@ fn rename_entry(path: String, new_name: String) -> Result<(), String> {
         return Err("Invalid folder name".to_string());
     }
     let source = Path::new(&path);
-    let target = source.parent().ok_or_else(|| "Invalid folder path".to_string())?.join(new_name);
-    fs::rename(source, target).map_err(|error| error.to_string())
+    let target = source.parent().ok_or_else(|| "Invalid folder path".to_string())?.join(&new_name);
+    // fs::rename silently replaces an existing file, so refuse instead. On a case-insensitive drive a
+    // case-only rename ("photo" -> "Photo") also "exists", but both paths resolve to the same item.
+    if target.exists() && fs::canonicalize(source).ok() != fs::canonicalize(&target).ok() {
+        return Err(format!("An item named \"{new_name}\" already exists in this folder."));
+    }
+    fs::rename(source, &target).map_err(|error| readable_rename_error(&error, source.is_dir()))
+}
+
+// Windows reports a locked file as a sharing violation (32) or lock violation (33). A folder that
+// something has open (a file inside it, or a program's working directory) comes back as access
+// denied (5) instead, which is what Explorer calls "Folder In Use".
+fn readable_rename_error(error: &std::io::Error, is_dir: bool) -> String {
+    match error.raw_os_error() {
+        Some(32) | Some(33) => "It is being used by another program.".to_string(),
+        Some(5) if is_dir => "It is being used by another program.".to_string(),
+        _ => error.to_string(),
+    }
 }
 
 #[tauri::command]
@@ -799,6 +815,67 @@ mod paste_entries_tests {
         drop(lock);
         assert!(folder.exists());
         assert!(error.contains("being used by another program") && error.contains("photo.jpg"), "{error}");
+    }
+
+    #[test]
+    fn rename_entry_refuses_to_overwrite_existing_file() {
+        let sandbox = Sandbox::new("rename-existing");
+        fs::write(sandbox.path("a.txt"), b"source").unwrap();
+        fs::write(sandbox.path("b.txt"), b"keep me").unwrap();
+        let error = rename_entry(sandbox.path("a.txt").to_string_lossy().to_string(), "b.txt".to_string()).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(fs::read_to_string(sandbox.path("a.txt")).unwrap(), "source");
+        assert_eq!(fs::read_to_string(sandbox.path("b.txt")).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn rename_entry_refuses_to_overwrite_existing_folder() {
+        let sandbox = Sandbox::new("rename-existing-folder");
+        fs::create_dir_all(sandbox.path("one")).unwrap();
+        fs::create_dir_all(sandbox.path("two")).unwrap();
+        fs::write(sandbox.path("two").join("inside.txt"), b"keep me").unwrap();
+        let error = rename_entry(sandbox.path("one").to_string_lossy().to_string(), "two".to_string()).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert!(sandbox.path("one").is_dir());
+        assert_eq!(fs::read_to_string(sandbox.path("two").join("inside.txt")).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn rename_entry_allows_case_only_change() {
+        let sandbox = Sandbox::new("rename-case");
+        fs::write(sandbox.path("photo.jpg"), b"x").unwrap();
+        rename_entry(sandbox.path("photo.jpg").to_string_lossy().to_string(), "Photo.jpg".to_string()).unwrap();
+        let names: Vec<String> = fs::read_dir(&sandbox.dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(names, vec!["Photo.jpg".to_string()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_entry_reports_file_in_use() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let sandbox = Sandbox::new("rename-file-in-use");
+        let file = sandbox.path("report.txt");
+        fs::write(&file, b"x").unwrap();
+        let lock = fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
+        let error = rename_entry(file.to_string_lossy().to_string(), "renamed.txt".to_string()).unwrap_err();
+        drop(lock);
+        assert!(file.exists());
+        assert!(error.contains("being used by another program"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_entry_reports_folder_in_use() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let sandbox = Sandbox::new("rename-folder-in-use");
+        let folder = sandbox.path("pix");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("photo.jpg"), b"x").unwrap();
+        let lock = fs::OpenOptions::new().read(true).share_mode(0).open(folder.join("photo.jpg")).unwrap();
+        let error = rename_entry(folder.to_string_lossy().to_string(), "renamed".to_string()).unwrap_err();
+        drop(lock);
+        assert!(folder.exists());
+        assert!(error.contains("being used by another program"), "{error}");
     }
 
     #[test]

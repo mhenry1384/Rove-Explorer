@@ -397,7 +397,17 @@ async function finishRename(index, entry, value) {
   const newName = value.trim();
   if (!newName || newName === entry.name || /[\\/:*?"<>|]/.test(newName)) { cancelRename(); return; }
   state.editing = null;
-  await invoke('rename_entry', { path: entry.path, newName });
+  try {
+    await invoke('rename_entry', { path: entry.path, newName });
+  } catch (error) {
+    render();
+    const kind = entry.kind === 'folder' ? 'folder' : 'file';
+    const text = /being used/i.test(String(error))
+      ? `Can't rename "${entry.name}" because the ${kind} is in use by another program.\n\nClose it and try again.`
+      : `Couldn't rename "${entry.name}".\n\n${error}`;
+    await message(text, { title: 'Rename failed', kind: 'error' });
+    return;
+  }
   const pane = state.panes[index]; const tab = currentTab(pane); tab.entries = await load(tab.path);
   selectSingle(tab, tab.entries.find((item) => item.name === newName)?.id || null);
   saveSession(); render();
