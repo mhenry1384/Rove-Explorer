@@ -12,7 +12,7 @@ import { version as APP_VERSION } from '../package.json';
 const SEP = sep();
 const isWindows = SEP === '\\';
 const COMPUTER_LABEL = isWindows ? 'This PC' : 'This Mac';
-const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], contextMenu: null, clipboard: null };
+const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], drives: [], contextMenu: null, clipboard: null };
 const stored = JSON.parse(localStorage.getItem('rove-explorer-state') || '{}');
 const session = JSON.parse(localStorage.getItem('rove-explorer-session') || '{}');
 const DOUBLE_CLICK_MS = 400;
@@ -61,7 +61,7 @@ function renderFileIcon(entry) {
   return `<span class="file-icon" data-icon-ext="${escapeAttribute(ext)}">·</span>`;
 }
 function escapeAttribute(value) { return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-function folderIcon(path) { const name = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase() || ''; return ['pictures', 'documents', 'downloads', 'desktop', 'music'].includes(name) ? name : 'folder'; }
+function folderIcon(path) { const name = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase() || ''; return ['pictures', 'documents', 'downloads', 'desktop', 'music', 'videos'].includes(name) ? name : 'folder'; }
 function folderLabel(path) { return path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'Home'; }
 function pathSegments(path) {
   const parts = path.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean);
@@ -123,12 +123,18 @@ async function load(path) {
   return entries.map((entry) => ({ ...entry, id: entry.path, extension: entry.kind === 'file' ? extension(entry.name) : '—', displayName: entry.kind === 'file' ? displayName(entry.name) : entry.name }));
 }
 
-async function loadDrives() { return (await invoke('list_drives')).map((entry) => ({ ...entry, id: entry.path, displayName: entry.name, extension: '—' })); }
+// Also refreshes the drive bookmarks, so they pick up drives added or removed since the last listing.
+async function loadDrives() {
+  const drives = (await invoke('list_drives')).map((entry) => ({ ...entry, id: entry.path, displayName: entry.name, extension: '—' }));
+  state.drives = drives.map(({ name, path }) => ({ name, path }));
+  return drives;
+}
 
 function render() {
   const activeTab = currentTab(state.panes[state.activePane]);
   const pathValue = activeTab?.path || '';
   const toolbar = state.folders.map((folder) => `<button class="quick-folder" data-folder-path="${escapeAttribute(folder.path)}" title="Open ${escapeAttribute(folder.path)}"><img src="/folder-icons/${folderIcon(folder.path)}.svg" alt=""><span>${escapeAttribute(folder.label)}</span></button>`).join('');
+  const driveBookmarks = state.drives.length ? `<div class="drive-bookmarks">${state.drives.map((drive) => `<button class="drive-bookmark" data-folder-path="${escapeAttribute(drive.path)}" title="Open ${escapeAttribute(drive.path)}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="4.5" width="13" height="7" rx="1"/><path d="M4 9.5h1.5"/><circle cx="11.5" cy="8" r=".6"/></svg><span>${escapeAttribute(drive.name)}</span></button>`).join('')}</div>` : '';
   const canGoBack = (activeTab?.historyIndex ?? 0) > 0;
   const canGoForward = !!activeTab && activeTab.historyIndex < (activeTab.history?.length ?? 1) - 1;
   const navHistory = `<button class="nav-history-button" data-go-back title="Back" aria-label="Go back" ${canGoBack ? '' : 'disabled'}>←</button><button class="nav-history-button" data-go-forward title="Forward" aria-label="Go forward" ${canGoForward ? '' : 'disabled'}>→</button><span class="toolbar-separator" aria-hidden="true"></span>`;
@@ -146,7 +152,7 @@ function render() {
   // WebView2 fires blur on a focused input as it is removed; mark the old box so its blur handler
   // doesn't treat being replaced as the user finishing (or abandoning) the rename.
   if (oldRename) oldRename.dataset.replaced = 'true';
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>F2</kbd> rename <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>F2</kbd> rename <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
   const newRename = renameSnapshot && document.querySelector('[data-rename]');
   if (newRename) { newRename.value = renameSnapshot.value; if (renameSnapshot.focused) { newRename.focus(); newRename.setSelectionRange(renameSnapshot.start, renameSnapshot.end); } }
   bindEvents();
@@ -337,7 +343,7 @@ function renderPane(pane, index) {
     ? `<div class="table-wrap tree-wrap" ${scrollAttrs}>${renderTreeBody(tab)}</div>`
     : view === 'thumbnails'
       ? `<div class="table-wrap thumb-wrap" ${scrollAttrs}>${renderThumbnails(entries, selected, focusId, index)}</div>`
-      : `<div class="table-wrap" ${scrollAttrs}><div class="table-head ${isDriveRoot ? 'drive-head' : ''}">${headers}</div><div class="rows">${rows}</div></div>`;
+      : `<div class="table-wrap details-wrap" ${scrollAttrs}><div class="table-head ${isDriveRoot ? 'drive-head' : ''}">${headers}</div><div class="rows">${rows}</div></div>`;
   const viewSelect = tab?.path ? `<div class="view-switch" role="group" aria-label="Pane view"><span class="view-label">${VIEW_MODES.find((mode) => mode.id === view)?.label ?? ''}</span>${VIEW_MODES.map((mode) => `<button class="view-button ${mode.id === view ? 'active' : ''}" data-view-mode="${mode.id}" title="${mode.label}" aria-label="${mode.label}" aria-pressed="${mode.id === view}"><svg viewBox="0 0 16 16" aria-hidden="true">${mode.icon}</svg></button>`).join('')}</div>` : '';
   return `<article class="pane ${state.activePane === index ? 'is-active' : ''}" data-pane="${index}"><div class="tabs">${pane.tabs.map((item, tabIndex) => `<button class="tab ${tabIndex === pane.activeTab ? 'active' : ''}" data-tab="${tabIndex}"><span class="tab-dot"></span>${item.label}${pane.tabs.length > 1 ? '<span class="tab-close" data-tab-close title="Close tab">×</span>' : ''}</button>`).join('')}<button class="new-tab" data-new-tab title="New tab">＋</button></div><div class="pathbar"><button class="nav-button" data-up title="Go up one level" aria-label="Go up one level">↑</button><div class="path-text">${breadcrumb}</div><span class="item-count">${entries.length} ITEMS</span></div>${body}<div class="pane-footer"><span class="selection-label">${selected.length ? `${selected.length} SELECTED` : 'NOTHING SELECTED'}</span>${viewSelect}</div></article>`;
 }
@@ -1051,6 +1057,14 @@ async function start() {
   }
   render();
 }
+
+// Names that don't fit their column are cut off with an ellipsis, so show the whole name on hover.
+document.addEventListener('mouseover', (event) => {
+  const name = event.target.closest('.file-name strong, .tree-name, .thumb-name');
+  if (!name) return;
+  if (name.scrollWidth > name.clientWidth) name.title = name.textContent;
+  else name.removeAttribute('title');
+});
 
 start().catch(() => render());
 listen('fs-changed', (event) => { scheduleFolderReload(event.payload); scheduleTreeRescans(event.payload); });
