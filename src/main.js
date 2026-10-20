@@ -61,7 +61,7 @@ function renderFileIcon(entry) {
   return `<span class="file-icon" data-icon-ext="${escapeAttribute(ext)}">·</span>`;
 }
 function escapeAttribute(value) { return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-function folderIcon(path) { const name = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase() || ''; return ['pictures', 'documents', 'downloads', 'desktop', 'music', 'videos'].includes(name) ? name : 'folder'; }
+function folderIcon(path) { const name = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase() || ''; return ['pictures', 'documents', 'downloads', 'desktop', 'music', 'videos'].includes(name) ? name : ['gdrive', 'google drive', 'my drive'].includes(name) ? 'gdrive' : 'folder'; }
 function folderLabel(path) { return path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'Home'; }
 function pathSegments(path) {
   const parts = path.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean);
