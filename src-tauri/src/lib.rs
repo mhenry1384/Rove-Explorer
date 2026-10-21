@@ -43,6 +43,7 @@ struct Entry {
     name: String,
     extension: String,
     size: String,
+    bytes: u64,
     modified: String,
     path: String,
 }
@@ -118,6 +119,36 @@ fn list_drives() -> Vec<Drive> {
     (b'A'..=b'Z').filter_map(|letter| drive_details(letter as char)).collect()
 }
 
+// A cheap fingerprint of the mounted drives, polled to notice drives being added or removed.
+#[cfg(windows)]
+fn drive_signature() -> Vec<String> {
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26).filter(|bit| mask & (1 << bit) != 0).map(|bit| ((b'A' + bit as u8) as char).to_string()).collect()
+}
+
+#[cfg(not(windows))]
+fn drive_signature() -> Vec<String> {
+    sysinfo::Disks::new_with_refreshed_list().list().iter().map(|disk| disk.mount_point().to_string_lossy().to_string()).collect()
+}
+
+// Emits "drives-changed" whenever a drive is mounted or unmounted.
+fn watch_drives(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut last = drive_signature();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let current = drive_signature();
+            if current != last {
+                last = current;
+                let _ = app.emit("drives-changed", ());
+            }
+        }
+    });
+}
+
 #[cfg(not(windows))]
 #[tauri::command]
 fn list_drives() -> Vec<Drive> {
@@ -159,6 +190,7 @@ fn read_directory(path: String, show_hidden: bool) -> Result<Vec<Entry>, String>
                 name,
                 extension,
                 size: if is_dir { "—".to_string() } else { format_size(metadata.len()) },
+                bytes: if is_dir { 0 } else { metadata.len() },
                 modified: metadata.modified().ok().and_then(|date| date.duration_since(std::time::UNIX_EPOCH).ok()).map(|date| date.as_secs().to_string()).unwrap_or_else(|| "—".to_string()),
                 path: item.path().to_string_lossy().to_string(),
             })
@@ -1403,6 +1435,7 @@ pub fn run() {
     #[cfg(not(windows))]
     let builder = builder.manage(ClipboardState::default());
     builder
+        .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
         .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, edit_in_text_editor, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");

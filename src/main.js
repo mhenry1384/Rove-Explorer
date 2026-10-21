@@ -118,9 +118,28 @@ function selectRange(tab, entries, anchorId, focusId) {
 function saveSession() { localStorage.setItem('rove-explorer-session', JSON.stringify({ panes: state.panes.map((pane) => ({ activeTab: pane.activeTab, tabs: pane.tabs.map(({ path, label, selected }) => ({ path, label, selected })) })) })); }
 function isEditing(index, entry) { return state.editing?.pane === index && state.editing.entryId === entry.id; }
 
+// Column sort for folder listings: folders always stay above files, and ties fall back to the name.
+const sortState = (() => { try { return JSON.parse(localStorage.getItem('rove-explorer-sort')) || { key: 'name', dir: 1 }; } catch { return { key: 'name', dir: 1 }; } })();
+const SORT_VALUES = { name: (entry) => entry.name.toLowerCase(), extension: (entry) => entry.extension.toLowerCase(), size: (entry) => entry.bytes ?? 0, modified: (entry) => (entry.modified === '—' ? -1 : Number(entry.modified)) };
+function compareValues(left, right) { return typeof left === 'number' ? left - right : left.localeCompare(right); }
+function sortEntries(entries) {
+  const value = SORT_VALUES[sortState.key] || SORT_VALUES.name;
+  return [...entries].sort((left, right) => (left.kind === 'folder' ? 0 : 1) - (right.kind === 'folder' ? 0 : 1) || sortState.dir * (compareValues(value(left), value(right)) || compareValues(SORT_VALUES.name(left), SORT_VALUES.name(right))));
+}
+function setSort(key) {
+  sortState.dir = sortState.key === key ? -sortState.dir : 1; sortState.key = key;
+  localStorage.setItem('rove-explorer-sort', JSON.stringify(sortState));
+  for (const pane of state.panes) for (const tab of pane.tabs) if (tab.kind === 'folder') tab.entries = sortEntries(tab.entries);
+  render();
+}
+function sortHeader(key, label) {
+  const active = sortState.key === key;
+  return `<button class="sort-header ${active ? 'active' : ''}" data-sort-key="${key}" title="Sort by ${label.toLowerCase()}">${label}<span class="sort-arrow" aria-hidden="true">${active ? (sortState.dir > 0 ? '▲' : '▼') : ''}</span></button>`;
+}
+
 async function load(path) {
   const entries = await invoke('read_directory', { path, showHidden: state.showHidden });
-  return entries.map((entry) => ({ ...entry, id: entry.path, extension: entry.kind === 'file' ? extension(entry.name) : '—', displayName: entry.kind === 'file' ? displayName(entry.name) : entry.name }));
+  return sortEntries(entries.map((entry) => ({ ...entry, id: entry.path, extension: entry.kind === 'file' ? extension(entry.name) : '—', displayName: entry.kind === 'file' ? displayName(entry.name) : entry.name })));
 }
 
 // Also refreshes the drive bookmarks, so they pick up drives added or removed since the last listing.
@@ -330,7 +349,7 @@ function renderThumbnails(entries, selected, focusId, index) {
 function renderPane(pane, index) {
   const tab = currentTab(pane); const entries = tab?.entries || []; const selected = tab?.selected || []; const focusId = tab?.focusId; const isDriveRoot = tab?.kind === 'drives';
   const view = tab?.view || 'details';
-  const headers = isDriveRoot ? '<span>NAME</span><span>TOTAL SIZE</span><span>FREE SPACE</span><span>FILE SYSTEM</span>' : '<span>NAME</span><span>EXTENSION</span><span>SIZE</span><span>MODIFIED</span>';
+  const headers = isDriveRoot ? '<span>NAME</span><span>TOTAL SIZE</span><span>FREE SPACE</span><span>FILE SYSTEM</span>' : `${sortHeader('name', 'NAME')}${sortHeader('extension', 'EXTENSION')}${sortHeader('size', 'SIZE')}${sortHeader('modified', 'MODIFIED')}`;
   const rows = entries.map((entry, entryIndex) => { const editing = isEditing(index, entry); const name = editing ? `<input class="rename-input" data-rename value="${escapeAttribute(entry.name)}" aria-label="Rename">` : `<strong>${entry.displayName}</strong>`; return `<button class="file-row ${isDriveRoot ? 'drive-row' : ''} ${selected.includes(entry.id) ? 'selected' : ''} ${entry.id === focusId ? 'focused' : ''} ${isCutEntry(entry) ? 'cut' : ''}" data-entry="${entry.id}" data-index="${entryIndex}"><span class="file-name">${renderFileIcon(entry)}${name}</span><span>${isDriveRoot ? entry.total : entry.extension}</span><span>${isDriveRoot ? entry.free : entry.size}</span><span>${isDriveRoot ? entry.fileSystem : (entry.modified === '—' ? '—' : new Date(Number(entry.modified) * 1000).toLocaleDateString('en', { month: 'short', day: 'numeric', year: 'numeric' }))}</span></button>`; }).join('') || '<div class="empty-state"><span>⌁</span><strong>This folder is empty</strong><small>Choose another location to keep moving.</small></div>';
   const breadcrumb = tab?.path
     ? pathSegments(tab.path).map((segment, segIndex) => `${segIndex > 0 ? '<span class="path-sep">/</span>' : ''}<button class="path-segment" data-breadcrumb="${escapeAttribute(segment.path)}">${escapeAttribute(segment.label)}</button>`).join('')
@@ -400,6 +419,26 @@ async function navigatePath(path) {
 function startRename(index, entry) { state.activePane = index; state.editing = { pane: index, entryId: entry.id, original: entry.name }; render(); const input = document.querySelector('[data-rename]'); input?.focus(); input?.select(); }
 
 function cancelRename() { state.editing = null; render(); }
+
+// Pressing anywhere outside the rename box finishes the rename. Row presses call preventDefault (so focus
+// never leaves the box and its blur handler never runs), so this listens in the capture phase instead.
+// A press elsewhere on the row being renamed is swallowed, so it doesn't select the row or restart the rename.
+let swallowClickAfterRename = false;
+document.addEventListener('pointerdown', (event) => {
+  swallowClickAfterRename = false;
+  const input = document.querySelector('[data-rename]');
+  if (!input || !state.editing || event.target.closest?.('[data-rename]')) return;
+  const sameRow = !!input.closest('[data-entry]') && event.target.closest?.('[data-entry]') === input.closest('[data-entry]');
+  const { pane: index, entryId } = state.editing;
+  const entry = currentTab(state.panes[index])?.entries.find((item) => item.id === entryId);
+  input.dataset.replaced = 'true'; // its blur handler would otherwise commit a second time
+  finishRename(index, entry, input.value).catch(() => cancelRename());
+  if (sameRow) { event.preventDefault(); event.stopPropagation(); swallowClickAfterRename = true; }
+}, true);
+document.addEventListener('click', (event) => {
+  if (!swallowClickAfterRename) return;
+  swallowClickAfterRename = false; event.preventDefault(); event.stopPropagation();
+}, true);
 
 async function finishRename(index, entry, value) {
   if (!entry) { cancelRename(); return; }
@@ -809,6 +848,7 @@ function findTabByTreeRequest(requestId) {
 }
 
 function bindEvents() {
+  document.querySelectorAll('[data-sort-key]').forEach((button) => button.addEventListener('click', () => setSort(button.dataset.sortKey)));
   document.querySelectorAll('[data-folder-path]').forEach((button) => button.addEventListener('click', async () => { try { await navigatePath(await resolveFolderPath(button.dataset.folderPath)); } catch { button.classList.add('is-unavailable'); } }));
   document.querySelectorAll('.pane').forEach((element) => { const index = Number(element.dataset.pane); const pane = state.panes[index]; element.addEventListener('click', () => { state.activePane = index; render(); });
     element.addEventListener('contextmenu', (event) => {
@@ -1067,6 +1107,20 @@ document.addEventListener('mouseover', (event) => {
 });
 
 start().catch(() => render());
+// A drive was mounted or unmounted: refresh the drive bookmarks and any tab showing the drive list.
+listen('drives-changed', async () => {
+  const drives = await loadDrives();
+  for (const pane of state.panes) {
+    for (const tab of pane.tabs) {
+      if (tab.kind !== 'drives') continue;
+      tab.entries = drives;
+      tab.selected = (tab.selected || []).filter((id) => drives.some((drive) => drive.id === id));
+      if (!drives.some((drive) => drive.id === tab.focusId)) tab.focusId = tab.selected[0] || null;
+      tab.anchorId = tab.focusId;
+    }
+  }
+  render();
+});
 listen('fs-changed', (event) => { scheduleFolderReload(event.payload); scheduleTreeRescans(event.payload); });
 listen('tree-progress', (event) => {
   const tab = findTabByTreeRequest(event.payload.requestId);

@@ -50,3 +50,5 @@ html, body, #app { height: 100%; overflow: hidden; }
 .move-icon-file { fill: var(--lime); }
 .move-button:hover:not(:disabled) .move-icon-file { fill: #fff; }
 .move-button:disabled .move-icon-file { fill: none; }
+.topbar, .folder-toolbar { -webkit-user-select: none; user-select: none; }.location-input { -webkit-user-select: text; user-select: text; }
+.sort-header { display: flex; align-items: center; gap: 4px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-align: left; cursor: pointer; }.sort-header:hover { color: var(--ink); }.sort-arrow { font-size: 7px; opacity: .55; }
