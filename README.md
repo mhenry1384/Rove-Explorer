@@ -57,7 +57,7 @@ npm run preview  # Preview the built frontend
 
 ## Configuration
 
-Pinned folders shown in the sidebar are defined in [`config/folders.json`](config/folders.json). Paths can use `~` to refer to the user's home directory.
+Bookmarks shown in the folder toolbar are defined in [`config/folders.json`](config/folders.json) as `{ "path", "name", "icon" }` entries. Paths can use `~` to refer to the user's home directory. `icon` names an SVG in `public/folder-icons/` (without the extension); `name` and `icon` are optional and default to the folder name and a guess from it. The file is bundled at build time, so rebuild after editing it.
 
 ## Project structure
 

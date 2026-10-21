@@ -152,7 +152,7 @@ async function loadDrives() {
 function render() {
   const activeTab = currentTab(state.panes[state.activePane]);
   const pathValue = activeTab?.path || '';
-  const toolbar = state.folders.map((folder) => `<button class="quick-folder" data-folder-path="${escapeAttribute(folder.path)}" title="Open ${escapeAttribute(folder.path)}"><img src="/folder-icons/${folderIcon(folder.path)}.svg" alt=""><span>${escapeAttribute(folder.label)}</span></button>`).join('');
+  const toolbar = state.folders.map((folder) => `<button class="quick-folder" data-folder-path="${escapeAttribute(folder.path)}" title="Open ${escapeAttribute(folder.path)}"><img src="/folder-icons/${escapeAttribute(folder.icon)}.svg" alt=""><span>${escapeAttribute(folder.label)}</span></button>`).join('');
   const driveBookmarks = state.drives.length ? `<div class="drive-bookmarks">${state.drives.map((drive) => `<button class="drive-bookmark" data-folder-path="${escapeAttribute(drive.path)}" title="Open ${escapeAttribute(drive.path)}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="4.5" width="13" height="7" rx="1"/><path d="M4 9.5h1.5"/><circle cx="11.5" cy="8" r=".6"/></svg><span>${escapeAttribute(drive.name)}</span></button>`).join('')}</div>` : '';
   const canGoBack = (activeTab?.historyIndex ?? 0) > 0;
   const canGoForward = !!activeTab && activeTab.historyIndex < (activeTab.history?.length ?? 1) - 1;
@@ -1077,7 +1077,8 @@ function drivesTab(drives, savedSelected) {
 }
 
 async function start() {
-  state.folders = configuredFolders.map((path) => ({ path, label: folderLabel(path) }));
+  // Each bookmark is { path, name?, icon? }; name defaults to the folder name and icon to a guess from it.
+  state.folders = configuredFolders.map(({ path, name, icon }) => ({ path, label: name || folderLabel(path), icon: icon || folderIcon(path) }));
   invoke('platform_name').then((name) => { platformName = name; }).catch(() => {});
   resolveResource('icons/32x32.png').then((path) => { dragIconPath = path; }).catch((error) => console.error('resolveResource failed', error));
   setupExternalDragDrop();
