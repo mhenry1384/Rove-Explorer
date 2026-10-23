@@ -465,7 +465,7 @@ async function finishRename(index, entry, value) {
   }
   const pane = state.panes[index]; const tab = currentTab(pane); tab.entries = await load(tab.path);
   selectSingle(tab, tab.entries.find((item) => item.name === newName)?.id || null);
-  saveSession(); render();
+  saveSession(); scrollSelectionIntoView = true; render();
 }
 
 async function deleteEntries(index, entries) {
@@ -564,6 +564,7 @@ async function createNewEntry(index, command) {
   if (!entry) { render(); return; }
   selectSingle(tab, entry.id);
   saveSession();
+  scrollSelectionIntoView = true;
   startRename(index, entry);
 }
 
