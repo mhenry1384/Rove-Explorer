@@ -25,7 +25,7 @@ struct IconCacheState {
     cache: Mutex<HashMap<String, Option<String>>>,
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 #[derive(Default)]
 struct ClipboardState {
     files: Mutex<Option<(Vec<String>, bool)>>,
@@ -83,7 +83,15 @@ fn is_hidden(path: &Path, name: &str) -> bool {
     name.starts_with('.') || (attributes != u32::MAX && attributes & (0x2 | 0x4) != 0)
 }
 
-#[cfg(not(windows))]
+// Finder also hides items carrying the UF_HIDDEN flag (~/Library, /bin, /usr, ...), not just dotfiles.
+#[cfg(target_os = "macos")]
+fn is_hidden(path: &Path, name: &str) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    const UF_HIDDEN: u32 = 0x8000;
+    name.starts_with('.') || fs::symlink_metadata(path).map(|metadata| metadata.st_flags() & UF_HIDDEN != 0).unwrap_or(false)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn is_hidden(_path: &Path, name: &str) -> bool {
     name.starts_with('.')
 }
@@ -129,9 +137,16 @@ fn drive_signature() -> Vec<String> {
     (0..26).filter(|bit| mask & (1 << bit) != 0).map(|bit| ((b'A' + bit as u8) as char).to_string()).collect()
 }
 
+// macOS mounts several system volumes (/System/Volumes/Data, VM, Preboot, ...) that Finder never
+// shows; only the startup disk and what's under /Volumes are drives a user would browse.
+#[cfg(not(windows))]
+fn is_user_volume(mount_point: &Path) -> bool {
+    !cfg!(target_os = "macos") || mount_point == Path::new("/") || mount_point.starts_with("/Volumes")
+}
+
 #[cfg(not(windows))]
 fn drive_signature() -> Vec<String> {
-    sysinfo::Disks::new_with_refreshed_list().list().iter().map(|disk| disk.mount_point().to_string_lossy().to_string()).collect()
+    sysinfo::Disks::new_with_refreshed_list().list().iter().filter(|disk| is_user_volume(disk.mount_point())).map(|disk| disk.mount_point().to_string_lossy().to_string()).collect()
 }
 
 // Emits "drives-changed" whenever a drive is mounted or unmounted.
@@ -155,6 +170,7 @@ fn list_drives() -> Vec<Drive> {
     let mut drives: Vec<Drive> = sysinfo::Disks::new_with_refreshed_list()
         .list()
         .iter()
+        .filter(|disk| is_user_volume(disk.mount_point()))
         .map(|disk| {
             let path = disk.mount_point().to_string_lossy().to_string();
             let label = disk.name().to_string_lossy().to_string();
@@ -199,9 +215,17 @@ fn read_directory(path: String, show_hidden: bool) -> Result<Vec<Entry>, String>
     Ok(entries)
 }
 
+#[cfg(windows)]
+const INVALID_NAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+// Finder shows a ':' in a name as '/', and the filesystem layer swaps them, so allow neither.
+#[cfg(target_os = "macos")]
+const INVALID_NAME_CHARS: &[char] = &['/', ':'];
+#[cfg(not(any(windows, target_os = "macos")))]
+const INVALID_NAME_CHARS: &[char] = &['/'];
+
 #[tauri::command]
 fn rename_entry(path: String, new_name: String) -> Result<(), String> {
-    if new_name.is_empty() || new_name == "." || new_name == ".." || new_name.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']) {
+    if new_name.is_empty() || new_name == "." || new_name == ".." || new_name.contains(INVALID_NAME_CHARS) {
         return Err("Invalid folder name".to_string());
     }
     let source = Path::new(&path);
@@ -293,6 +317,23 @@ fn platform_name() -> &'static str {
     std::env::consts::OS
 }
 
+// Whether every path lives on the same volume as dest_dir, so a drop there moves rather than copies.
+// Windows answers this from the drive letter on the frontend instead.
+#[tauri::command]
+fn same_volume(paths: Vec<String>, dest_dir: String) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(dest) = fs::metadata(&dest_dir) else { return false };
+        paths.iter().all(|path| fs::symlink_metadata(path).map(|metadata| metadata.dev() == dest.dev()).unwrap_or(false))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (paths, dest_dir);
+        true
+    }
+}
+
 #[tauri::command]
 fn edit_in_text_editor(paths: Vec<String>) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -322,10 +363,20 @@ fn show_properties(paths: Vec<String>) -> Result<(), String> {
     {
         win_properties::show(&paths)
     }
-    #[cfg(not(windows))]
+    // Finder's Get Info window, one per item as Finder itself does. The paths go in as script
+    // arguments rather than being spliced into the script, so no quoting is needed.
+    #[cfg(target_os = "macos")]
+    {
+        let script = ["on run argv", "tell application \"Finder\"", "activate", "repeat with itemPath in argv", "open information window of (POSIX file (contents of itemPath) as alias)", "end repeat", "end tell", "end run"];
+        let mut command = std::process::Command::new("osascript");
+        for line in script { command.args(["-e", line]); }
+        command.args(&paths).spawn().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = paths;
-        Err("The properties dialog is only available on Windows".to_string())
+        Err("The properties dialog is only available on Windows and macOS".to_string())
     }
 }
 
@@ -632,14 +683,72 @@ fn clipboard_read_paths() -> Result<Option<ClipboardFiles>, String> {
     Ok(win_clipboard::read_paths()?.map(|(paths, cut)| ClipboardFiles { paths, cut }))
 }
 
-#[cfg(not(windows))]
+// Puts file URLs on the general pasteboard, the way Finder's Copy does, so items copied here paste
+// in Finder and vice versa. Finder has no Cut (it moves on paste with ⌥⌘V instead), so whether our
+// own last write was a cut is remembered alongside the pasteboard's change count: once anything
+// else writes to the pasteboard the count moves on and the pasted items are treated as a copy.
+#[cfg(target_os = "macos")]
+mod mac_clipboard {
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, ProtocolObject};
+    use objc2::ClassType;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardURLReadingFileURLsOnlyKey, NSPasteboardWriting};
+    use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
+    use std::sync::Mutex;
+
+    static CUT_CHANGE_COUNT: Mutex<Option<isize>> = Mutex::new(None);
+
+    pub fn write_paths(paths: &[String], cut: bool) -> Result<(), String> {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let urls: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = paths
+            .iter()
+            .map(|path| ProtocolObject::from_retained(NSURL::fileURLWithPath(&NSString::from_str(path))))
+            .collect();
+        pasteboard.clearContents();
+        if !pasteboard.writeObjects(&NSArray::from_retained_slice(&urls)) {
+            return Err("Couldn't write to the clipboard".to_string());
+        }
+        *CUT_CHANGE_COUNT.lock().map_err(|_| "clipboard lock poisoned".to_string())? = cut.then(|| pasteboard.changeCount());
+        Ok(())
+    }
+
+    pub fn read_paths() -> Result<Option<(Vec<String>, bool)>, String> {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let classes = NSArray::from_slice(&[NSURL::class()]);
+        let file_urls_only = NSNumber::new_bool(true);
+        let value: &AnyObject = &file_urls_only;
+        let options = NSDictionary::from_slices(&[unsafe { NSPasteboardURLReadingFileURLsOnlyKey }], &[value]);
+        let Some(objects) = (unsafe { pasteboard.readObjectsForClasses_options(&classes, Some(&options)) }) else { return Ok(None) };
+        let paths: Vec<String> = objects
+            .iter()
+            .filter_map(|object| object.downcast_ref::<NSURL>().and_then(|url| url.path()).map(|path| path.to_string()))
+            .collect();
+        if paths.is_empty() { return Ok(None); }
+        let cut = *CUT_CHANGE_COUNT.lock().map_err(|_| "clipboard lock poisoned".to_string())? == Some(pasteboard.changeCount());
+        Ok(Some((paths, cut)))
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn clipboard_write_paths(paths: Vec<String>, cut: bool) -> Result<(), String> {
+    mac_clipboard::write_paths(&paths, cut)
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn clipboard_read_paths() -> Result<Option<ClipboardFiles>, String> {
+    Ok(mac_clipboard::read_paths()?.map(|(paths, cut)| ClipboardFiles { paths, cut }))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 #[tauri::command]
 fn clipboard_write_paths(state: State<ClipboardState>, paths: Vec<String>, cut: bool) -> Result<(), String> {
     *state.files.lock().map_err(|_| "clipboard lock poisoned".to_string())? = Some((paths, cut));
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 #[tauri::command]
 fn clipboard_read_paths(state: State<ClipboardState>) -> Result<Option<ClipboardFiles>, String> {
     let files = state.files.lock().map_err(|_| "clipboard lock poisoned".to_string())?;
@@ -1395,6 +1504,45 @@ fn extract_extension_icon_rgba(extension: &str) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 #[cfg(windows)]
+fn extension_icon_png(extension: &str) -> Option<Vec<u8>> {
+    let (width, height, rgba) = extract_extension_icon_rgba(extension)?;
+    let image = image::RgbaImage::from_raw(width, height, rgba)?;
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .ok()?;
+    Some(bytes)
+}
+
+// The icon Finder shows for files with this extension, drawn at 32x32 so it stays sharp on Retina
+// displays when shown at 16 points. iconForContentType: would need a UTType for the extension;
+// iconForFileType: takes the extension directly and still works.
+#[cfg(target_os = "macos")]
+fn extension_icon_png(extension: &str) -> Option<Vec<u8>> {
+    use objc2::AnyThread;
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSGraphicsContext, NSWorkspace};
+    use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
+
+    const ICON_PIXELS: isize = 32;
+    let file_type = NSString::from_str(extension.trim_start_matches('.'));
+    #[allow(deprecated)]
+    let image = NSWorkspace::sharedWorkspace().iconForFileType(&file_type);
+    let rep = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(), std::ptr::null_mut(), ICON_PIXELS, ICON_PIXELS, 8, 4, true, false, NSDeviceRGBColorSpace, 0, 0,
+        )
+    }?;
+    let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(ICON_PIXELS as f64, ICON_PIXELS as f64));
+    image.drawInRect_fromRect_operation_fraction(rect, NSRect::ZERO, NSCompositingOperation::SourceOver, 1.0);
+    NSGraphicsContext::restoreGraphicsState_class();
+    let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
+    Some(png.to_vec())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 #[tauri::command]
 fn get_extension_icon(state: State<IconCacheState>, extension: String) -> Option<String> {
     let key = extension.to_lowercase();
@@ -1403,21 +1551,14 @@ fn get_extension_icon(state: State<IconCacheState>, extension: String) -> Option
             return cached.clone();
         }
     }
-    let result = extract_extension_icon_rgba(&key).and_then(|(width, height, rgba)| {
-        let image = image::RgbaImage::from_raw(width, height, rgba)?;
-        let mut bytes = Vec::new();
-        image::DynamicImage::ImageRgba8(image)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-            .ok()?;
-        Some(format!("data:image/png;base64,{}", base64_encode(&bytes)))
-    });
+    let result = extension_icon_png(&key).map(|bytes| format!("data:image/png;base64,{}", base64_encode(&bytes)));
     if let Ok(mut cache) = state.cache.lock() {
         cache.insert(key, result.clone());
     }
     result
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 #[tauri::command]
 fn get_extension_icon(_state: State<IconCacheState>, _extension: String) -> Option<String> {
     None
@@ -1432,11 +1573,11 @@ pub fn run() {
         .manage(WatcherState::default())
         .manage(TreeState::default())
         .manage(IconCacheState::default());
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, edit_in_text_editor, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }

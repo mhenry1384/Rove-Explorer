@@ -11,6 +11,8 @@ import { version as APP_VERSION } from '../package.json';
 
 const SEP = sep();
 const isWindows = SEP === '\\';
+const isMac = !isWindows && /Mac/.test(navigator.platform || navigator.userAgent);
+const CURRENT_PLATFORM = isWindows ? 'windows' : isMac ? 'macos' : 'linux';
 const COMPUTER_LABEL = isWindows ? 'This PC' : 'This Mac';
 const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], drives: [], contextMenu: null, clipboard: null };
 const stored = JSON.parse(localStorage.getItem('rove-explorer-state') || '{}');
@@ -32,7 +34,7 @@ const TYPE_AHEAD_TIMEOUT_MS = 1000;
 let typeAheadBuffer = '';
 let typeAheadTime = 0;
 const fsChangeTimers = new Map();
-let platformName = isWindows ? 'windows' : 'other';
+let platformName = CURRENT_PLATFORM;
 let dragIconPath = null;
 let internalDragPaths = null;
 let dragHoverEl = null;
@@ -61,7 +63,7 @@ function renderFileIcon(entry) {
   return `<span class="file-icon" data-icon-ext="${escapeAttribute(ext)}">·</span>`;
 }
 function escapeAttribute(value) { return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-function folderIcon(path) { const name = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase() || ''; return ['pictures', 'documents', 'downloads', 'desktop', 'music', 'videos'].includes(name) ? name : ['gdrive', 'google drive', 'my drive'].includes(name) ? 'gdrive' : 'folder'; }
+function folderIcon(path) { const name = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase() || ''; return ['pictures', 'documents', 'downloads', 'desktop', 'music', 'videos'].includes(name) ? name : name === 'movies' ? 'videos' :['gdrive', 'google drive', 'my drive'].includes(name) ? 'gdrive' : 'folder'; }
 function folderLabel(path) { return path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'Home'; }
 function pathSegments(path) {
   const parts = path.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean);
@@ -171,7 +173,7 @@ function render() {
   // WebView2 fires blur on a focused input as it is removed; mark the old box so its blur handler
   // doesn't treat being replaced as the user finishing (or abandoning) the rename.
   if (oldRename) oldRename.dataset.replaced = 'true';
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>F2</kbd> rename <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span>${SHORTCUT_HINTS}</span></footer>${renderContextMenu()}`;
   const newRename = renameSnapshot && document.querySelector('[data-rename]');
   if (newRename) { newRename.value = renameSnapshot.value; if (renameSnapshot.focused) { newRename.focus(); newRename.setSelectionRange(renameSnapshot.start, renameSnapshot.end); } }
   bindEvents();
@@ -276,6 +278,11 @@ function scheduleFolderReload(changedPath) {
   }, 200));
 }
 
+const SHORTCUT_HINTS = isMac
+  ? '<kbd>Return</kbd> open <kbd>⌫</kbd> up a level <kbd>F2</kbd> rename <kbd>⌘</kbd>+<kbd>⌫</kbd> move to Trash <kbd>⌘</kbd>+<kbd>[</kbd> back <kbd>⌘</kbd>+<kbd>]</kbd> forward'
+  : '<kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>F2</kbd> rename <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward';
+// Characters the OS won't accept in a file name (macOS reserves ':' because Finder displays it as '/').
+const INVALID_NAME_CHARS = isWindows ? /[\\/:*?"<>|]/ : isMac ? /[/:]/ : /\//;
 function textEditorLabel() { return platformName === 'macos' ? 'Edit in TextEdit' : 'Edit in Notepad'; }
 function canEditInTextEditor(pane) { return (platformName === 'windows' || platformName === 'macos') && selectedFileEntries(pane).some((entry) => entry.kind === 'file'); }
 
@@ -298,7 +305,7 @@ function renderContextMenu() {
   if (!state.contextMenu) return '';
   const { x, y, kind, pane } = state.contextMenu;
   const tab = currentTab(state.panes[pane]);
-  const properties = platformName === 'windows' && propertiesPaths(state.contextMenu).length ? '<button data-context-properties>Properties</button>' : '';
+  const properties = (platformName === 'windows' || platformName === 'macos') && propertiesPaths(state.contextMenu).length ? `<button data-context-properties>${platformName === 'macos' ? 'Get Info' : 'Properties'}</button>` : '';
   const items = kind === 'pane'
     ? `${tab?.path ? '<button data-context-new-folder>New Folder</button><button data-context-new-file>New File</button>' : ''}<button data-context-paste>Paste</button>${properties}`
     : `${kind === 'file' ? `<button data-context-copy>Copy</button><button data-context-cut>Cut</button>${canEditInTextEditor(pane) ? `<button data-context-edit-notepad>${textEditorLabel()}</button>` : ''}` : ''}<button class="danger" data-context-delete>Delete</button>${properties}`;
@@ -443,7 +450,7 @@ document.addEventListener('click', (event) => {
 async function finishRename(index, entry, value) {
   if (!entry) { cancelRename(); return; }
   const newName = value.trim();
-  if (!newName || newName === entry.name || /[\\/:*?"<>|]/.test(newName)) { cancelRename(); return; }
+  if (!newName || newName === entry.name || INVALID_NAME_CHARS.test(newName)) { cancelRename(); return; }
   state.editing = null;
   try {
     await invoke('rename_entry', { path: entry.path, newName });
@@ -587,7 +594,6 @@ function isInternalDrag(paths) {
 }
 
 function driveOf(path) {
-  if (!isWindows) return '/';
   const match = /^[A-Za-z]:/.exec(path);
   return match ? match[0].toLowerCase() : '';
 }
@@ -615,10 +621,10 @@ function setDragHover(el) {
   dragHoverEl?.classList.add('drop-target');
 }
 
-// Drags between our own panes always move; drops from other apps follow Explorer's rule
-// of moving within a drive and copying across drives.
-function dropFilesIntoPane(paneIndex, destDir, paths) {
-  const cut = isInternalDrag(paths) || paths.every((path) => sameDrive(path, destDir));
+// Drags between our own panes always move; drops from other apps follow Explorer's (and Finder's)
+// rule of moving within a drive and copying across drives.
+async function dropFilesIntoPane(paneIndex, destDir, paths) {
+  const cut = isInternalDrag(paths) || (isWindows ? paths.every((path) => sameDrive(path, destDir)) : await invoke('same_volume', { paths, destDir }));
   return transferIntoPane(paneIndex, destDir, paths, { cut, verb: 'dropped' });
 }
 
@@ -867,7 +873,8 @@ function bindEvents() {
         const entry = tab.entries[Number(row.dataset.index)];
         state.activePane = index;
         if (state.editing) return;
-        const isToggle = (event.ctrlKey || event.metaKey) && entry.kind !== 'drive';
+        // On a Mac, Ctrl+click is a right-click, so only Command toggles the selection.
+        const isToggle = (isMac ? event.metaKey : event.ctrlKey || event.metaKey) && entry.kind !== 'drive';
         if (event.shiftKey && entry.kind !== 'drive') {
           if (!tab.anchorId) tab.anchorId = tab.focusId || entry.id;
           // Ctrl+Shift adds the range to what's already selected instead of replacing it.
@@ -1028,9 +1035,16 @@ document.addEventListener('keydown', (event) => {
   if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'x') { event.preventDefault(); cutSelected(state.activePane); return; }
   if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'v') { event.preventDefault(); pasteIntoPane(state.activePane); return; }
   if (event.key === 'Delete' && !isTyping) { event.preventDefault(); deleteSelected(state.activePane); return; }
-  if (event.altKey && event.key === 'ArrowLeft') { event.preventDefault(); goBack(state.activePane); return; }
-  if (event.altKey && event.key === 'ArrowRight') { event.preventDefault(); goForward(state.activePane); return; }
+  // In a Mac text field Option+arrow moves by word, so there it only navigates outside of one.
+  if (event.altKey && event.key === 'ArrowLeft' && !(isMac && isTyping)) { event.preventDefault(); goBack(state.activePane); return; }
+  if (event.altKey && event.key === 'ArrowRight' && !(isMac && isTyping)) { event.preventDefault(); goForward(state.activePane); return; }
   if (isTyping) return;
+  // Finder's shortcuts: ⌘⌫ to Trash (Mac laptops have no forward-Delete key), ⌘[ / ⌘] back and
+  // forward, ⌘↑ to the enclosing folder, ⌘↓ to open.
+  if (isMac && event.metaKey && !event.altKey) {
+    const action = { Backspace: () => deleteSelected(state.activePane), '[': () => goBack(state.activePane), ']': () => goForward(state.activePane), ArrowUp: () => goUp(state.activePane), ArrowDown: () => enter(state.activePane, tab?.view !== 'tree' && tab?.entries.find((entry) => entry.id === tab.focusId)) }[event.key];
+    if (action) { event.preventDefault(); action(); return; }
+  }
   if (event.key === 'F2') {
     event.preventDefault();
     const entry = tab?.view !== 'tree' && tab?.entries.find((item) => item.id === tab.focusId);
@@ -1078,7 +1092,7 @@ function drivesTab(drives, savedSelected) {
 
 async function start() {
   // Each bookmark is { path, name?, icon? }; name defaults to the folder name and icon to a guess from it.
-  state.folders = configuredFolders.map(({ path, name, icon }) => ({ path, label: name || folderLabel(path), icon: icon || folderIcon(path) }));
+  state.folders = configuredFolders.filter(({ platform }) => !platform || platform === CURRENT_PLATFORM).map(({ path, name, icon }) => ({ path, label: name || folderLabel(path), icon: icon || folderIcon(path) }));
   invoke('platform_name').then((name) => { platformName = name; }).catch(() => {});
   resolveResource('icons/32x32.png').then((path) => { dragIconPath = path; }).catch((error) => console.error('resolveResource failed', error));
   setupExternalDragDrop();

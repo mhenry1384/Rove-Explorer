@@ -26,6 +26,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(not(windows))'.dependencies]
 sysinfo = { version = "0.39.6", default-features = false, features = ["disk"] }
 
+# Already in the tree via Tauri; used for the Finder-compatible clipboard and file-type icons.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["objc2-core-graphics"] }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

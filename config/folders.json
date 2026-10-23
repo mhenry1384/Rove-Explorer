@@ -1,10 +1,11 @@
 [
-  { "path": "~\\Desktop", "name": "Desktop", "icon": "desktop" },
-  { "path": "~\\Documents", "name": "Documents", "icon": "documents" },
-  { "path": "~\\Downloads", "name": "Downloads", "icon": "downloads" },
-  { "path": "~\\Pictures", "name": "Pictures", "icon": "pictures" },
-  { "path": "~\\Music", "name": "Music", "icon": "music" },
-  { "path": "~\\Videos", "name": "Videos", "icon": "videos" },
-  { "path": "C:/Users/mhenr/GDrive", "name": "GDrive", "icon": "gdrive" },
-  { "path": "C:/Users/mhenr/Downloads/Pixel 6a Sync", "name": "Pixel 6a Sync", "icon": "android-phone" }
+  { "path": "~/Desktop", "name": "Desktop", "icon": "desktop" },
+  { "path": "~/Documents", "name": "Documents", "icon": "documents" },
+  { "path": "~/Downloads", "name": "Downloads", "icon": "downloads" },
+  { "path": "~/Pictures", "name": "Pictures", "icon": "pictures" },
+  { "path": "~/Music", "name": "Music", "icon": "music" },
+  { "path": "~/Videos", "name": "Videos", "icon": "videos", "platform": "windows" },
+  { "path": "~/Movies", "name": "Movies", "icon": "videos", "platform": "macos" },
+  { "path": "C:/Users/mhenr/GDrive", "name": "GDrive", "icon": "gdrive", "platform": "windows" },
+  { "path": "C:/Users/mhenr/Downloads/Pixel 6a Sync", "name": "Pixel 6a Sync", "icon": "android-phone", "platform": "windows" }
 ]

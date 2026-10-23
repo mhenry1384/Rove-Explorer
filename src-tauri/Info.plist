@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Rove Explorer asks Finder to move items to the Trash and to show Get Info windows.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Rove Explorer needs access to browse and manage files on your Desktop.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Rove Explorer needs access to browse and manage files in your Documents folder.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Rove Explorer needs access to browse and manage files in your Downloads folder.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>Rove Explorer needs access to browse and manage files on removable drives.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>Rove Explorer needs access to browse and manage files on network drives.</string>
+</dict>
+</plist>
