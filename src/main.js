@@ -789,6 +789,23 @@ function moveSelection(index, direction, extend) {
   saveSession(); scrollSelectionIntoView = true; render();
 }
 
+// Arrow keys in the thumbnail grid move the way it looks: up/down by a row, left/right by one card,
+// stopping at the edges of the grid rather than wrapping around.
+function thumbnailStep(index, key) {
+  const tab = currentTab(state.panes[index]); const entries = tab?.entries || [];
+  const current = entries.findIndex((entry) => entry.id === tab?.focusId);
+  if (current < 0) return key === 'ArrowUp' || key === 'ArrowLeft' ? -1 : 1;
+  const cards = [...document.querySelectorAll(`.pane[data-pane="${index}"] .thumb-card`)];
+  const columns = Math.max(1, cards.filter((card) => card.offsetTop === cards[0]?.offsetTop).length);
+  const last = entries.length - 1;
+  if (key === 'ArrowLeft') return current > 0 ? -1 : 0;
+  if (key === 'ArrowRight') return current < last ? 1 : 0;
+  if (key === 'ArrowUp') return current >= columns ? -columns : 0;
+  // Down from a row with nothing directly below lands on the last card, as in Explorer.
+  if (current + columns <= last) return columns;
+  return Math.floor(current / columns) < Math.floor(last / columns) ? last - current : 0;
+}
+
 function startTreeView(index) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.path) return;
@@ -1050,6 +1067,12 @@ document.addEventListener('keydown', (event) => {
     event.preventDefault();
     const entry = tab?.view !== 'tree' && tab?.entries.find((item) => item.id === tab.focusId);
     if (entry && entry.kind !== 'drive') { clearTimeout(entryClickTimer); startRename(state.activePane, entry); }
+    return;
+  }
+  if (tab?.view === 'thumbnails' && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key)) {
+    event.preventDefault();
+    const step = thumbnailStep(state.activePane, event.key);
+    if (step) moveSelection(state.activePane, step, event.shiftKey);
     return;
   }
   if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveSelection(state.activePane, event.key === 'ArrowUp' ? -1 : 1, event.shiftKey); return; }
