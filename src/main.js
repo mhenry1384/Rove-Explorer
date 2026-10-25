@@ -851,11 +851,21 @@ function setPaneView(index, view) {
   render();
 }
 
-function openTreeNodeInDetails(index, path) {
+function findTreeNode(node, targetPath) {
+  if (!node) return null;
+  if (node.path === targetPath) return node;
+  for (const child of node.children) { const found = findTreeNode(child, targetPath); if (found) return found; }
+  return null;
+}
+
+// navigateTabTo keeps the tab in tree view and rescans the new folder, unless it has no subfolders.
+function openTreeNode(index, path) {
   const tab = currentTab(state.panes[index]);
   if (!tab || tab.view !== 'tree') return;
-  if (tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
-  tab.view = 'details'; tab.treeState = null;
+  if (findTreeNode(tab.treeState?.tree, path)?.children.length === 0) {
+    if (tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
+    tab.view = 'details'; tab.treeState = null;
+  }
   navigateTabTo(index, path);
 }
 
@@ -999,7 +1009,7 @@ function bindEvents() {
       row.addEventListener('dblclick', (event) => {
         if (event.target.closest('[data-tree-caret]')) return;
         event.stopPropagation();
-        openTreeNodeInDetails(index, row.dataset.treeNode);
+        openTreeNode(index, row.dataset.treeNode);
       });
       row.addEventListener('contextmenu', (event) => {
         event.preventDefault(); event.stopPropagation();
@@ -1077,7 +1087,7 @@ document.addEventListener('keydown', (event) => {
   }
   if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveSelection(state.activePane, event.key === 'ArrowUp' ? -1 : 1, event.shiftKey); return; }
   if ((event.key === 'Home' || event.key === 'End') && tab?.view !== 'tree') { event.preventDefault(); moveSelection(state.activePane, event.key === 'Home' ? -Infinity : Infinity, event.shiftKey); return; }
-  if (event.key === 'Enter' && tab?.view === 'tree') { event.preventDefault(); if (tab.treeState?.selected) openTreeNodeInDetails(state.activePane, tab.treeState.selected); return; }
+  if (event.key === 'Enter' && tab?.view === 'tree') { event.preventDefault(); if (tab.treeState?.selected) openTreeNode(state.activePane, tab.treeState.selected); return; }
   if (event.key === 'Enter') { event.preventDefault(); enter(state.activePane, tab?.entries.find((entry) => entry.id === tab.focusId)); return; }
   if (event.key === 'Backspace') { event.preventDefault(); goUp(state.activePane); return; }
   if (!state.contextMenu && !event.ctrlKey && !event.altKey && !event.metaKey && event.key.length === 1) { event.preventDefault(); handleTypeAhead(state.activePane, event.key); }
