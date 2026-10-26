@@ -7,5 +7,6 @@
   { "path": "~/Videos", "name": "Videos", "icon": "videos", "platform": "windows" },
   { "path": "~/Movies", "name": "Movies", "icon": "videos", "platform": "macos" },
   { "path": "C:/Users/mhenr/GDrive", "name": "GDrive", "icon": "gdrive", "platform": "windows" },
-  { "path": "C:/Users/mhenr/Downloads/Pixel 6a Sync", "name": "Pixel 6a Sync", "icon": "android-phone", "platform": "windows" }
+  { "path": "C:/Users/mhenr/Downloads/Pixel 6a Sync", "name": "Pixel 6a Sync", "icon": "android-phone", "platform": "windows" },
+  { "path": "~/Library/CloudStorage/OneDrive-Slalom", "name": "OneDrive", "icon": "folder", "platform": "macos" }
 ]
