@@ -306,9 +306,10 @@ function renderContextMenu() {
   const { x, y, kind, pane } = state.contextMenu;
   const tab = currentTab(state.panes[pane]);
   const properties = (platformName === 'windows' || platformName === 'macos') && propertiesPaths(state.contextMenu).length ? `<button data-context-properties>${platformName === 'macos' ? 'Get Info' : 'Properties'}</button>` : '';
+  const renameable = kind === 'file' && tab?.entries.find((entry) => entry.id === state.contextMenu.entryId)?.kind !== 'drive';
   const items = kind === 'pane'
     ? `${tab?.path ? '<button data-context-new-folder>New Folder</button><button data-context-new-file>New File</button>' : ''}<button data-context-paste>Paste</button>${properties}`
-    : `${kind === 'file' ? `<button data-context-copy>Copy</button><button data-context-cut>Cut</button>${canEditInTextEditor(pane) ? `<button data-context-edit-notepad>${textEditorLabel()}</button>` : ''}` : ''}<button class="danger" data-context-delete>Delete</button>${properties}`;
+    : `${kind === 'file' ? `<button data-context-copy>Copy</button><button data-context-cut>Cut</button>${renameable ? '<button data-context-rename>Rename</button>' : ''}${canEditInTextEditor(pane) ? `<button data-context-edit-notepad>${textEditorLabel()}</button>` : ''}` : ''}<button class="danger" data-context-delete>Delete</button>${properties}`;
   return `<div class="context-menu" data-context-menu style="left:${x}px; top:${y}px">${items}</div>`;
 }
 
@@ -1044,6 +1045,12 @@ function bindEvents() {
     if (!menu) return;
     if (menu.kind === 'tree') { deleteTreeNode(menu.pane, menu.path); return; }
     deleteSelected(menu.pane);
+  });
+  document.querySelector('[data-context-rename]')?.addEventListener('click', () => {
+    const menu = state.contextMenu;
+    const entry = menu && currentTab(state.panes[menu.pane])?.entries.find((item) => item.id === menu.entryId);
+    state.contextMenu = null;
+    if (entry) startRename(menu.pane, entry); else render();
   });
   document.querySelector('[data-context-copy]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) copySelected(menu.pane); });
   document.querySelector('[data-context-cut]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) cutSelected(menu.pane); });

@@ -1,6 +1,6 @@
 [package]
 name = "rove-explorer"
-version = "0.4.4"
+version = "0.4.5"
 description = "A focused two-pane file explorer"
 authors = ["Rove Explorer"]
 edition = "2021"
