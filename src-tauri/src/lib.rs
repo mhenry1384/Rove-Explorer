@@ -571,6 +571,8 @@ mod win_shell {
     #[repr(C)]
     struct Guid(u32, u16, u16, [u8; 8]);
     const IID_IDATAOBJECT: Guid = Guid(0x0000_010e, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+    const IID_ISHELLITEM: Guid = Guid(0x4382_6d1e, 0xe718, 0x42ee, [0xbc, 0x55, 0xa1, 0xe2, 0x61, 0xc3, 0x7b, 0xfe]);
+    const BHID_DATA_OBJECT: Guid = Guid(0xb8c0_bd9f, 0xed24, 0x455c, [0x83, 0xe6, 0xd5, 0x39, 0x0c, 0x4f, 0xe8, 0xc4]);
 
     #[link(name = "shell32")]
     extern "system" {
@@ -579,6 +581,7 @@ mod win_shell {
         fn SHCreateDataObject(pidl_folder: *const c_void, count: u32, pidls: *const *mut c_void, inner: *mut c_void, riid: *const Guid, out: *mut *mut c_void) -> i32;
         fn SHMultiFileProperties(data_object: *mut c_void, flags: u32) -> i32;
         fn SHAssocEnumHandlers(extension: *const u16, filter: u32, enumerator: *mut *mut c_void) -> i32;
+        fn SHCreateItemFromParsingName(path: *const u16, bind_ctx: *mut c_void, riid: *const Guid, item: *mut *mut c_void) -> i32;
         fn ExtractIconExW(file: *const u16, index: i32, large: *mut isize, small: *mut isize, count: u32) -> u32;
     }
     #[link(name = "ole32")]
@@ -663,6 +666,26 @@ mod win_shell {
         for pidl in pidls {
             unsafe { CoTaskMemFree(pidl) };
         }
+        result
+    }
+
+    // The data object a file's IShellItem hands out, the form IAssocHandler::Invoke expects.
+    fn with_item_data_object(path: &str, use_object: impl FnOnce(*mut c_void) -> Result<(), String>) -> Result<(), String> {
+        let mut item = std::ptr::null_mut();
+        let hr = unsafe { SHCreateItemFromParsingName(wide(path).as_ptr(), std::ptr::null_mut(), &IID_ISHELLITEM, &mut item) };
+        if hr < 0 {
+            return Err(format!("Couldn't resolve {path} (HRESULT {hr:#x})"));
+        }
+        // IShellItem::BindToHandler
+        let bind: extern "system" fn(*mut c_void, *mut c_void, *const Guid, *const Guid, *mut *mut c_void) -> i32 = unsafe { std::mem::transmute(method(item, 3)) };
+        let mut data_object = std::ptr::null_mut();
+        let hr = bind(item, std::ptr::null_mut(), &BHID_DATA_OBJECT, &IID_IDATAOBJECT, &mut data_object);
+        unsafe { release(item) };
+        if hr < 0 {
+            return Err(format!("Couldn't get a data object for {path} (HRESULT {hr:#x})"));
+        }
+        let result = use_object(data_object);
+        unsafe { release(data_object) };
         result
     }
 
@@ -761,7 +784,7 @@ mod win_shell {
             if unsafe { handler_string(handler, 3) }.as_deref() != Some(app_id) {
                 return true;
             }
-            result = with_data_object(&[path.to_string()], |data_object| {
+            result = with_item_data_object(path, |data_object| {
                 // IAssocHandler::Invoke
                 let invoke: extern "system" fn(*mut c_void, *mut c_void) -> i32 = unsafe { std::mem::transmute(method(handler, 8)) };
                 let hr = invoke(handler, data_object);
