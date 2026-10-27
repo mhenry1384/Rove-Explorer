@@ -5,6 +5,7 @@ import { homeDir, sep, resolveResource } from '@tauri-apps/api/path';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { openPath } from '@tauri-apps/plugin-opener';
 import { ask, message } from '@tauri-apps/plugin-dialog';
+import { Menu, MenuItem, IconMenuItem, Submenu, PredefinedMenuItem } from '@tauri-apps/api/menu';
 import { startDrag } from '@crabnebula/tauri-plugin-drag';
 import configuredFolders from '../config/folders.json';
 import { version as APP_VERSION } from '../package.json';
@@ -14,7 +15,7 @@ const isWindows = SEP === '\\';
 const isMac = !isWindows && /Mac/.test(navigator.platform || navigator.userAgent);
 const CURRENT_PLATFORM = isWindows ? 'windows' : isMac ? 'macos' : 'linux';
 const COMPUTER_LABEL = isWindows ? 'This PC' : 'This Mac';
-const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], drives: [], contextMenu: null, clipboard: null };
+const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], drives: [], clipboard: null };
 const stored = JSON.parse(localStorage.getItem('rove-explorer-state') || '{}');
 const session = JSON.parse(localStorage.getItem('rove-explorer-session') || '{}');
 const DOUBLE_CLICK_MS = 400;
@@ -173,7 +174,7 @@ function render() {
   // WebView2 fires blur on a focused input as it is removed; mark the old box so its blur handler
   // doesn't treat being replaced as the user finishing (or abandoning) the rename.
   if (oldRename) oldRename.dataset.replaced = 'true';
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span>${SHORTCUT_HINTS}</span></footer>${renderContextMenu()}`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span>${SHORTCUT_HINTS}</span></footer>`;
   const newRename = renameSnapshot && document.querySelector('[data-rename]');
   if (newRename) { newRename.value = renameSnapshot.value; if (renameSnapshot.focused) { newRename.focus(); newRename.setSelectionRange(renameSnapshot.start, renameSnapshot.end); } }
   bindEvents();
@@ -200,6 +201,7 @@ function render() {
     scrollSelectionIntoView = false;
   }
   syncWatchedPaths();
+  prefetchOpenWithApps();
 }
 
 function syncWatchedPaths() {
@@ -290,31 +292,41 @@ function canEditInTextEditor(pane) {
   return (platformName === 'windows' || platformName === 'macos') && entries.length > 0 && entries.every((entry) => entry.kind === 'file' && TEXT_EDITOR_EXTENSIONS.has(extension(entry.name).toLowerCase()));
 }
 const OPEN_WITH_OTHER_LABEL = isMac ? 'Other…' : 'Choose another app';
-const SUBMENU_WIDTH_PX = 260;
+// The apps Open With offers depend only on the file's extension, so they're kept per extension:
+// the list once it has loaded, or the pending request until then.
+const openWithCache = new Map();
+function openWithKey(entry) { return extension(entry.name).toLowerCase(); }
+function singleSelectedFile(index) { const entries = selectedFileEntries(index); return entries.length === 1 && entries[0].kind === 'file' ? entries[0] : null; }
 
-// Open With is offered for a single selected file; the apps for its type load while the menu is open.
-function loadOpenWithApps(menu) {
-  const entries = selectedFileEntries(menu.pane);
-  if (!(platformName === 'windows' || platformName === 'macos') || entries.length !== 1 || entries[0].kind !== 'file') return;
-  menu.openWith = { path: entries[0].path, apps: null };
-  invoke('list_open_with_apps', { path: entries[0].path })
-    .catch(() => [])
-    .then((apps) => { menu.openWith.apps = apps; if (state.contextMenu === menu) render(); });
+// Looks the apps up as soon as a single file is selected, so they're usually ready by the time
+// the context menu opens (a native menu can't change once it's showing).
+function prefetchOpenWithApps() {
+  if (!(platformName === 'windows' || platformName === 'macos')) return;
+  state.panes.forEach((_, index) => {
+    const entry = singleSelectedFile(index);
+    if (!entry || openWithCache.has(openWithKey(entry))) return;
+    const key = openWithKey(entry);
+    openWithCache.set(key, invoke('list_open_with_apps', { path: entry.path }).catch(() => []).then((apps) => { openWithCache.set(key, apps); return apps; }));
+  });
 }
 
-function renderOpenWith(menu) {
-  if (!menu.openWith) return '';
-  const apps = menu.openWith.apps === null ? '<button disabled>Loading…</button>' : menu.openWith.apps.map((app, appIndex) => `<button data-open-with-app="${appIndex}">${app.icon ? `<img class="menu-icon" src="${escapeAttribute(app.icon)}" alt="">` : '<span class="menu-icon"></span>'}${escapeAttribute(app.name)}</button>`).join('');
-  // Open the submenu leftward when there isn't room for it to the right of the menu.
-  const leftward = menu.x + 150 + SUBMENU_WIDTH_PX > window.innerWidth;
-  return `<div class="context-submenu-parent"><button class="context-submenu-trigger">Open With<span aria-hidden="true">▸</span></button><div class="context-submenu ${leftward ? 'is-leftward' : ''}">${apps}${apps ? '<hr>' : ''}<button data-open-with-other>${OPEN_WITH_OTHER_LABEL}</button></div></div>`;
-}
+function dataUriBytes(uri) { return Uint8Array.from(atob(uri.slice(uri.indexOf(',') + 1)), (char) => char.charCodeAt(0)); }
 
-function openWith(menu, command, args) {
-  const { path } = menu.openWith;
-  state.contextMenu = null;
-  render();
+function openWith(path, command, args) {
   invoke(command, { path, ...args }).catch((error) => message(String(error), { title: 'Open With failed', kind: 'error' }));
+}
+
+// Apps still loading are left out; "Choose another app" is always there.
+async function openWithSubmenu(entry) {
+  const cached = openWithCache.get(openWithKey(entry));
+  const apps = Array.isArray(cached) ? cached : [];
+  const appItems = await Promise.all(apps.map((app) => {
+    const action = () => openWith(entry.path, 'open_with_app', { appId: app.id });
+    return app.icon ? IconMenuItem.new({ text: app.name, icon: dataUriBytes(app.icon), action }) : MenuItem.new({ text: app.name, action });
+  }));
+  const other = await MenuItem.new({ text: OPEN_WITH_OTHER_LABEL, action: () => openWith(entry.path, 'open_with_other_app', {}) });
+  const items = appItems.length ? [...appItems, await PredefinedMenuItem.new({ item: 'Separator' }), other] : [other];
+  return Submenu.new({ text: 'Open With', items });
 }
 
 // What a context menu's Properties item describes: the clicked selection, the clicked tree folder,
@@ -327,21 +339,36 @@ function propertiesPaths(menu) {
 
 function showProperties(menu) {
   const paths = propertiesPaths(menu);
-  state.contextMenu = null;
-  render();
   if (paths.length) invoke('show_properties', { paths }).catch((error) => console.error('show_properties failed', error));
 }
 
-function renderContextMenu() {
-  if (!state.contextMenu) return '';
-  const { x, y, kind, pane } = state.contextMenu;
+// The right-click menu is the OS's own, so it can extend past the window and the OS keeps it on screen.
+// `menu` is { pane, kind: 'pane' | 'file' | 'tree', entryId?, path? }.
+async function showContextMenu(menu) {
+  const { kind, pane } = menu;
   const tab = currentTab(state.panes[pane]);
-  const properties = (platformName === 'windows' || platformName === 'macos') && propertiesPaths(state.contextMenu).length ? `<button data-context-properties>${platformName === 'macos' ? 'Get Info' : 'Properties'}</button>` : '';
-  const renameable = kind === 'file' && tab?.entries.find((entry) => entry.id === state.contextMenu.entryId)?.kind !== 'drive';
-  const items = kind === 'pane'
-    ? `${tab?.path ? '<button data-context-new-folder>New Folder</button><button data-context-new-file>New File</button>' : ''}<button data-context-paste>Paste</button>${properties}`
-    : `${kind === 'file' ? `${renderOpenWith(state.contextMenu)}<button data-context-copy>Copy</button><button data-context-cut>Cut</button>${renameable ? '<button data-context-rename>Rename</button>' : ''}${canEditInTextEditor(pane) ? `<button data-context-edit-notepad>${textEditorLabel()}</button>` : ''}${tab?.path ? '<button data-context-compress>Compress</button>' : ''}` : ''}<button class="danger" data-context-delete>Delete</button>${properties}`;
-  return `<div class="context-menu" data-context-menu style="left:${x}px; top:${y}px">${items}</div>`;
+  const item = (text, action) => MenuItem.new({ text, action });
+  const separator = () => PredefinedMenuItem.new({ item: 'Separator' });
+  const items = [];
+  if (kind === 'pane') {
+    if (tab?.path) items.push(item('New Folder', () => createNewEntry(pane, 'create_folder')), item('New File', () => createNewEntry(pane, 'create_file')));
+    items.push(item('Paste', () => pasteIntoPane(pane)));
+  } else {
+    if (kind === 'file') {
+      const single = singleSelectedFile(pane);
+      if (single && (platformName === 'windows' || platformName === 'macos')) items.push(openWithSubmenu(single), separator());
+      items.push(item('Copy', () => copySelected(pane)), item('Cut', () => cutSelected(pane)));
+      const entry = tab?.entries.find((candidate) => candidate.id === menu.entryId);
+      if (entry && entry.kind !== 'drive') items.push(item('Rename', () => startRename(pane, entry)));
+      if (canEditInTextEditor(pane)) items.push(item(textEditorLabel(), () => editSelectedInTextEditor(pane)));
+      if (tab?.path) items.push(item('Compress', () => compressSelected(pane, menu.entryId)));
+      items.push(separator());
+    }
+    items.push(item('Delete', () => (kind === 'tree' ? deleteTreeNode(pane, menu.path) : deleteSelected(pane))));
+  }
+  if ((platformName === 'windows' || platformName === 'macos') && propertiesPaths(menu).length) items.push(separator(), item(platformName === 'macos' ? 'Get Info' : 'Properties', () => showProperties(menu)));
+  const nativeMenu = await Menu.new({ items: await Promise.all(items) });
+  await nativeMenu.popup();
 }
 
 function renderTreeNode(node, depth, treeState, isRoot) {
@@ -514,7 +541,6 @@ async function deleteEntries(index, entries) {
   tab.selected = (tab.selected || []).filter((id) => !deletedIds.has(id));
   if (deletedIds.has(tab.focusId)) tab.focusId = null;
   if (deletedIds.has(tab.anchorId)) tab.anchorId = tab.focusId;
-  state.contextMenu = null;
   saveSession(); render();
   if (failures.length) await showDeleteFailures(failures);
 }
@@ -546,7 +572,6 @@ async function copySelected(index) {
   const paths = entries.map((entry) => entry.path);
   await invoke('clipboard_write_paths', { paths, cut: false });
   state.clipboard = { paths, cut: false };
-  state.contextMenu = null;
   render();
 }
 
@@ -556,14 +581,11 @@ async function cutSelected(index) {
   const paths = entries.map((entry) => entry.path);
   await invoke('clipboard_write_paths', { paths, cut: true });
   state.clipboard = { paths, cut: true };
-  state.contextMenu = null;
   render();
 }
 
 async function pasteIntoPane(index) {
   const tab = currentTab(state.panes[index]);
-  state.contextMenu = null;
-  render();
   if (!tab?.path) return;
   let payload;
   try { payload = await invoke('clipboard_read_paths'); } catch { return; }
@@ -588,7 +610,6 @@ async function pasteIntoPane(index) {
 
 async function createNewEntry(index, command) {
   const tab = currentTab(state.panes[index]);
-  state.contextMenu = null;
   if (!tab?.path) { render(); return; }
   const path = await invoke(command, { destDir: tab.path });
   tab.entries = await load(tab.path);
@@ -602,8 +623,6 @@ async function createNewEntry(index, command) {
 
 async function editSelectedInTextEditor(index) {
   const entries = selectedFileEntries(index).filter((entry) => entry.kind === 'file');
-  state.contextMenu = null;
-  render();
   if (!entries.length) return;
   await invoke('edit_in_text_editor', { paths: entries.map((entry) => entry.path) }).catch((error) => console.error('edit_in_text_editor failed', error));
 }
@@ -612,8 +631,6 @@ async function editSelectedInTextEditor(index) {
 async function compressSelected(index, entryId) {
   const tab = currentTab(state.panes[index]);
   const entries = selectedFileEntries(index);
-  state.contextMenu = null;
-  render();
   if (!tab?.path || !entries.length) return;
   const folderPath = tab.path;
   // The archive is named after the first path, so put the right-clicked item first.
@@ -797,10 +814,9 @@ function removeTreeNode(node, targetPath) {
 async function deleteTreeNode(index, path) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.treeState?.tree || path === tab.treeState.tree.path) return;
-  try { await invoke('delete_entry', { path }); } catch (error) { state.contextMenu = null; render(); await showDeleteFailures([{ name: path.split(/[\\/]/).pop(), error }]); return; }
+  try { await invoke('delete_entry', { path }); } catch (error) { render(); await showDeleteFailures([{ name: path.split(/[\\/]/).pop(), error }]); return; }
   removeTreeNode(tab.treeState.tree, path);
   if (tab.treeState.selected === path) tab.treeState.selected = null;
-  state.contextMenu = null;
   render();
 }
 
@@ -945,8 +961,8 @@ function bindEvents() {
       event.preventDefault();
       if (state.editing) return;
       state.activePane = index;
-      state.contextMenu = { pane: index, kind: 'pane', x: event.clientX, y: event.clientY };
       render();
+      showContextMenu({ pane: index, kind: 'pane' });
     });
     element.querySelectorAll('[data-entry]').forEach((row) => {
       let suppressNextClick = false;
@@ -1027,9 +1043,8 @@ function bindEvents() {
         if (entry.kind === 'drive') return;
         state.activePane = index;
         if (!(tab.selected || []).includes(entry.id)) { selectSingle(tab, entry.id); if (tab.path) remember(tab.path, entry.name); }
-        state.contextMenu = { pane: index, kind: 'file', entryId: entry.id, x: event.clientX, y: event.clientY };
-        loadOpenWithApps(state.contextMenu);
         render();
+        showContextMenu({ pane: index, kind: 'file', entryId: entry.id });
       });
       // Drags are started from pointermove (see pendingPress); keep the browser's own drag (e.g. of a thumbnail image) out of the way.
       row.addEventListener('dragstart', (event) => event.preventDefault());
@@ -1075,8 +1090,8 @@ function bindEvents() {
         if (path === tab.treeState.tree.path) return;
         state.activePane = index;
         tab.treeState.selected = path;
-        state.contextMenu = { pane: index, kind: 'tree', path, x: event.clientX, y: event.clientY };
         render();
+        showContextMenu({ pane: index, kind: 'tree', path });
       });
     });
   });
@@ -1092,35 +1107,9 @@ function bindEvents() {
   locationInput.addEventListener('blur', () => { justFocusedLocation = false; });
   locationInput.addEventListener('keydown', (event) => { if (event.key !== 'Enter') return; event.preventDefault(); const input = event.currentTarget; navigatePath(input.value).catch(() => input.select()); });
   const renameInput = document.querySelector('[data-rename]'); renameInput?.addEventListener('click', (event) => event.stopPropagation()); renameInput?.addEventListener('keyup', (event) => { if (event.key === ' ') event.preventDefault(); /* else releasing Space "presses" the row button the box sits in */ }); renameInput?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelRename(); } if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); } }); renameInput?.addEventListener('blur', (event) => { if (event.currentTarget.dataset.replaced) return; const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); if (entry) finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); });
-  const contextMenu = document.querySelector('[data-context-menu]');
-  contextMenu?.addEventListener('click', (event) => event.stopPropagation());
-  contextMenu?.addEventListener('contextmenu', (event) => event.preventDefault());
-  document.querySelector('[data-context-delete]')?.addEventListener('click', () => {
-    const menu = state.contextMenu;
-    if (!menu) return;
-    if (menu.kind === 'tree') { deleteTreeNode(menu.pane, menu.path); return; }
-    deleteSelected(menu.pane);
-  });
-  document.querySelector('[data-context-rename]')?.addEventListener('click', () => {
-    const menu = state.contextMenu;
-    const entry = menu && currentTab(state.panes[menu.pane])?.entries.find((item) => item.id === menu.entryId);
-    state.contextMenu = null;
-    if (entry) startRename(menu.pane, entry); else render();
-  });
-  document.querySelector('[data-context-copy]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) copySelected(menu.pane); });
-  document.querySelector('[data-context-cut]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) cutSelected(menu.pane); });
-  document.querySelector('[data-context-paste]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) pasteIntoPane(menu.pane); });
-  document.querySelector('[data-context-new-file]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) createNewEntry(menu.pane, 'create_file'); });
-  document.querySelector('[data-context-new-folder]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) createNewEntry(menu.pane, 'create_folder'); });
-  document.querySelector('[data-context-properties]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) showProperties(menu); });
-  document.querySelector('[data-context-edit-notepad]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) editSelectedInTextEditor(menu.pane); });
-  document.querySelector('[data-context-compress]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) compressSelected(menu.pane, menu.entryId); });
-  document.querySelectorAll('[data-open-with-app]').forEach((button) => button.addEventListener('click', () => { const menu = state.contextMenu; const app = menu?.openWith?.apps?.[Number(button.dataset.openWithApp)]; if (app) openWith(menu, 'open_with_app', { appId: app.id }); }));
-  document.querySelector('[data-open-with-other]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu?.openWith) openWith(menu, 'open_with_other_app', {}); });
 }
 
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && state.contextMenu) { state.contextMenu = null; render(); return; }
   const isTyping = event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA';
   const pane = state.panes[state.activePane]; const tab = currentTab(pane);
   const isClipboardCombo = (event.ctrlKey || event.metaKey) && !event.altKey;
@@ -1155,7 +1144,7 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && tab?.view === 'tree') { event.preventDefault(); if (tab.treeState?.selected) openTreeNode(state.activePane, tab.treeState.selected); return; }
   if (event.key === 'Enter') { event.preventDefault(); enter(state.activePane, tab?.entries.find((entry) => entry.id === tab.focusId)); return; }
   if (event.key === 'Backspace') { event.preventDefault(); goUp(state.activePane); return; }
-  if (!state.contextMenu && !event.ctrlKey && !event.altKey && !event.metaKey && event.key.length === 1) { event.preventDefault(); handleTypeAhead(state.activePane, event.key); }
+  if (!event.ctrlKey && !event.altKey && !event.metaKey && event.key.length === 1) { event.preventDefault(); handleTypeAhead(state.activePane, event.key); }
 });
 document.addEventListener('pointermove', (event) => {
   if (!pendingPress) return;
@@ -1178,11 +1167,6 @@ document.addEventListener('pointerup', () => {
   }
 });
 document.addEventListener('pointercancel', () => { pendingPress = null; });
-document.addEventListener('click', (event) => {
-  if (!state.contextMenu || event.target.closest('.context-menu')) return;
-  state.contextMenu = null; render();
-}, true);
-document.addEventListener('contextmenu', (event) => { if (state.contextMenu && !event.target.closest('.context-menu')) { state.contextMenu = null; } }, true);
 
 function drivesTab(drives, savedSelected) {
   const selected = validOrFirst(drives, savedSelected);
