@@ -1,6 +1,6 @@
 [package]
 name = "rove-explorer"
-version = "0.4.5"
+version = "0.4.6"
 description = "A focused two-pane file explorer"
 authors = ["Rove Explorer"]
 edition = "2021"
@@ -22,6 +22,8 @@ tauri-plugin-drag = "2"
 notify = "6"
 trash = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+zip = { version = "9.1.2", default-features = false, features = ["chrono", "deflate-flate2"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [target.'cfg(not(windows))'.dependencies]
 sysinfo = { version = "0.39.6", default-features = false, features = ["disk"] }

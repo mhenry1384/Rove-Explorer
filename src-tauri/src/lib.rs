@@ -357,11 +357,66 @@ fn edit_in_text_editor(paths: Vec<String>) -> Result<(), String> {
     }
 }
 
+// Zips the given files and folders into a new archive beside them, named after the first one,
+// as Explorer's "Compress to ZIP file" does. Returns the archive's path.
+#[tauri::command]
+async fn compress_entries(paths: Vec<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || compress(&paths)).await.map_err(|error| error.to_string())?
+}
+
+fn compress(paths: &[String]) -> Result<String, String> {
+    let first = Path::new(paths.first().ok_or("Nothing to compress")?);
+    let dir = first.parent().ok_or("A drive can't be compressed")?;
+    let stem = if first.is_dir() { first.file_name() } else { first.file_stem() };
+    let stem = stem.map(|name| name.to_string_lossy().to_string()).unwrap_or_else(|| "Archive".to_string());
+    let archive = unused_name(dir, &stem, ".zip");
+    let result = write_zip(&archive, paths).map_err(|error| error.to_string());
+    if result.is_err() {
+        let _ = fs::remove_file(&archive);
+    }
+    result.map(|()| archive.to_string_lossy().to_string())
+}
+
+fn write_zip(archive: &Path, paths: &[String]) -> zip::result::ZipResult<()> {
+    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(fs::File::create(archive)?));
+    for path in paths {
+        let path = Path::new(path);
+        let name = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+        add_to_zip(&mut zip, path, &name)?;
+    }
+    zip.finish()?;
+    Ok(())
+}
+
+fn add_to_zip<W: std::io::Write + std::io::Seek>(zip: &mut zip::ZipWriter<W>, path: &Path, name: &str) -> zip::result::ZipResult<()> {
+    let metadata = fs::metadata(path)?;
+    // Zip timestamps are local time with no zone; anything outside 1980-2107 keeps the default.
+    let mut options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    if let Some(modified) = metadata.modified().ok().and_then(|time| zip::DateTime::try_from(chrono::DateTime::<chrono::Local>::from(time).naive_local()).ok()) {
+        options = options.last_modified_time(modified);
+    }
+    if metadata.is_dir() {
+        zip.add_directory(format!("{name}/"), options)?;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            // Following a symlinked folder could loop forever, so those are left out.
+            if entry.file_type()?.is_symlink() && entry.path().is_dir() {
+                continue;
+            }
+            add_to_zip(zip, &entry.path(), &format!("{name}/{}", entry.file_name().to_string_lossy()))?;
+        }
+    } else {
+        zip.start_file(name, options.large_file(metadata.len() >= u32::MAX as u64))?;
+        std::io::copy(&mut fs::File::open(path)?, zip)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn show_properties(paths: Vec<String>) -> Result<(), String> {
     #[cfg(windows)]
     {
-        win_properties::show(&paths)
+        win_shell::show_properties(&paths)
     }
     // Finder's Get Info window, one per item as Finder itself does. The paths go in as script
     // arguments rather than being spliced into the script, so no quoting is needed.
@@ -380,15 +435,119 @@ fn show_properties(paths: Vec<String>) -> Result<(), String> {
     }
 }
 
-// Opens Explorer's own Properties dialog: a single item goes through the "properties" shell verb,
-// several items through SHMultiFileProperties, which shows the combined "N files" sheet Explorer does.
+#[derive(Serialize)]
+struct OpenWithApp {
+    id: String,
+    name: String,
+    icon: Option<String>,
+}
+
+// The apps the OS suggests for this file, as listed in Explorer's "Open with" submenu or Finder's
+// "Open With" menu. An app's id is what open_with_app takes to launch it. Gathering the apps and
+// their icons can take a few seconds on Windows, so that runs off the UI thread.
 #[cfg(windows)]
-mod win_properties {
+#[tauri::command]
+async fn list_open_with_apps(path: String) -> Vec<OpenWithApp> {
+    tauri::async_runtime::spawn_blocking(move || win_shell::open_with_apps(&path)).await.unwrap_or_default()
+}
+
+// AppKit wants the main thread, which a synchronous command runs on.
+#[cfg(not(windows))]
+#[tauri::command]
+fn list_open_with_apps(path: String) -> Vec<OpenWithApp> {
+    #[cfg(target_os = "macos")]
+    {
+        mac_open_with::apps(&path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Vec::new()
+    }
+}
+
+#[tauri::command]
+fn open_with_app(path: String, app_id: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win_shell::open_with(&path, &app_id)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").args(["-a", &app_id, &path]).spawn().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (path, app_id);
+        Err("Open With is only available on Windows and macOS".to_string())
+    }
+}
+
+// Explorer's "Choose another app" picker; on macOS, a Choose Application dialog.
+#[tauri::command]
+fn open_with_other_app(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win_shell::invoke_verb(&path, "openas")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = ["on run argv", "set chosenApp to choose application with prompt \"Choose an application to open the document:\" as alias", "tell application \"Finder\" to open (POSIX file (item 1 of argv) as alias) using chosenApp", "end run"];
+        let mut command = std::process::Command::new("osascript");
+        for line in script { command.args(["-e", line]); }
+        command.arg(&path).spawn().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = path;
+        Err("Open With is only available on Windows and macOS".to_string())
+    }
+}
+
+// Lists the apps registered for the file's extension, with their icons.
+#[cfg(target_os = "macos")]
+mod mac_open_with {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSFileManager, NSString, NSURL};
+
+    pub fn apps(path: &str) -> Vec<super::OpenWithApp> {
+        let workspace = NSWorkspace::sharedWorkspace();
+        let file_url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        let default_app = workspace.URLForApplicationToOpenURL(&file_url).and_then(|url| url.path()).map(|path| path.to_string());
+        let mut app_paths: Vec<String> = workspace.URLsForApplicationsToOpenURL(&file_url).iter().filter_map(|url| url.path()).map(|path| path.to_string()).collect();
+        // The default app goes first, as in Finder.
+        if let Some(default_app) = &default_app {
+            app_paths.retain(|app| app != default_app);
+            app_paths.insert(0, default_app.clone());
+        }
+        let file_manager = NSFileManager::defaultManager();
+        app_paths
+            .into_iter()
+            .map(|app_path| {
+                let ns_path = NSString::from_str(&app_path);
+                let name = file_manager.displayNameAtPath(&ns_path).to_string();
+                let name = name.strip_suffix(".app").map(str::to_string).unwrap_or(name);
+                let icon = super::image_png(&workspace.iconForFile(&ns_path)).map(|bytes| format!("data:image/png;base64,{}", super::base64_encode(&bytes)));
+                super::OpenWithApp { id: app_path, name, icon }
+            })
+            .collect()
+    }
+}
+
+// Explorer's shell dialogs and handlers: Properties (a single item through the "properties" verb,
+// several through SHMultiFileProperties, which shows the combined "N files" sheet Explorer does)
+// and the "Open with" handlers registered for a file type.
+#[cfg(windows)]
+mod win_shell {
     use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
 
     const SEE_MASK_INVOKEIDLIST: u32 = 0x0000_000C;
     const SW_SHOW: i32 = 5;
+    const ASSOC_FILTER_RECOMMENDED: u32 = 0x1;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
 
     #[repr(C)]
     struct ShellExecuteInfoW {
@@ -419,26 +578,32 @@ mod win_properties {
         fn SHParseDisplayName(name: *const u16, bind_ctx: *mut c_void, pidl: *mut *mut c_void, sfgao_in: u32, sfgao_out: *mut u32) -> i32;
         fn SHCreateDataObject(pidl_folder: *const c_void, count: u32, pidls: *const *mut c_void, inner: *mut c_void, riid: *const Guid, out: *mut *mut c_void) -> i32;
         fn SHMultiFileProperties(data_object: *mut c_void, flags: u32) -> i32;
+        fn SHAssocEnumHandlers(extension: *const u16, filter: u32, enumerator: *mut *mut c_void) -> i32;
+        fn ExtractIconExW(file: *const u16, index: i32, large: *mut isize, small: *mut isize, count: u32) -> u32;
     }
     #[link(name = "ole32")]
     extern "system" {
         fn CoTaskMemFree(ptr: *mut c_void);
+        fn CoInitializeEx(reserved: *mut c_void, flags: u32) -> i32;
+    }
+    extern "system" {
+        fn DestroyIcon(icon: isize) -> i32;
     }
 
     fn wide(value: &str) -> Vec<u16> {
         OsStr::new(value).encode_wide().chain(Some(0)).collect()
     }
 
-    pub fn show(paths: &[String]) -> Result<(), String> {
+    pub fn show_properties(paths: &[String]) -> Result<(), String> {
         match paths {
             [] => Ok(()),
-            [path] => show_single(path),
+            [path] => invoke_verb(path, "properties"),
             _ => show_multiple(paths),
         }
     }
 
-    fn show_single(path: &str) -> Result<(), String> {
-        let verb = wide("properties");
+    pub fn invoke_verb(path: &str, verb: &str) -> Result<(), String> {
+        let verb = wide(verb);
         let file = wide(path);
         let mut info = ShellExecuteInfoW {
             cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
@@ -464,6 +629,17 @@ mod win_properties {
     }
 
     fn show_multiple(paths: &[String]) -> Result<(), String> {
+        with_data_object(paths, |data_object| {
+            let hr = unsafe { SHMultiFileProperties(data_object, 0) };
+            if hr < 0 {
+                return Err(format!("SHMultiFileProperties failed (HRESULT {hr:#x})"));
+            }
+            Ok(())
+        })
+    }
+
+    // Runs `use_object` with a shell data object (IDataObject) holding the given paths.
+    fn with_data_object(paths: &[String], use_object: impl FnOnce(*mut c_void) -> Result<(), String>) -> Result<(), String> {
         let mut pidls: Vec<*mut c_void> = Vec::with_capacity(paths.len());
         let result = (|| {
             for path in paths {
@@ -480,12 +656,9 @@ mod win_properties {
             if hr < 0 {
                 return Err(format!("SHCreateDataObject failed (HRESULT {hr:#x})"));
             }
-            let hr = unsafe { SHMultiFileProperties(data_object, 0) };
+            let result = use_object(data_object);
             unsafe { release(data_object) };
-            if hr < 0 {
-                return Err(format!("SHMultiFileProperties failed (HRESULT {hr:#x})"));
-            }
-            Ok(())
+            result
         })();
         for pidl in pidls {
             unsafe { CoTaskMemFree(pidl) };
@@ -493,11 +666,113 @@ mod win_properties {
         result
     }
 
+    // The address in a COM object's vtable slot, to be transmuted to that method's signature.
+    unsafe fn method(object: *mut c_void, slot: usize) -> usize {
+        *(*(object as *const *const usize)).add(slot)
+    }
+
     // IUnknown::Release is the third vtable slot of every COM interface.
     unsafe fn release(object: *mut c_void) {
-        let vtable = *(object as *const *const usize);
-        let release: extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtable.add(2));
+        let release: extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(method(object, 2));
         release(object);
+    }
+
+    // Calls an IAssocHandler method that hands back a CoTaskMemAlloc'd string (GetName, GetUIName).
+    unsafe fn handler_string(handler: *mut c_void, slot: usize) -> Option<String> {
+        let get: extern "system" fn(*mut c_void, *mut *mut u16) -> i32 = std::mem::transmute(method(handler, slot));
+        let mut value: *mut u16 = std::ptr::null_mut();
+        if get(handler, &mut value) < 0 || value.is_null() {
+            return None;
+        }
+        Some(take_co_string(value))
+    }
+
+    unsafe fn take_co_string(value: *mut u16) -> String {
+        let len = (0..).take_while(|&index| *value.add(index) != 0).count();
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(value, len));
+        CoTaskMemFree(value as *mut c_void);
+        text
+    }
+
+    // IAssocHandler::GetIconLocation, drawn as a PNG data URI. Store apps report an
+    // indirect resource string rather than a file, and get no icon.
+    unsafe fn handler_icon(handler: *mut c_void) -> Option<String> {
+        let get: extern "system" fn(*mut c_void, *mut *mut u16, *mut i32) -> i32 = std::mem::transmute(method(handler, 5));
+        let mut location: *mut u16 = std::ptr::null_mut();
+        let mut index = 0;
+        if get(handler, &mut location, &mut index) < 0 || location.is_null() {
+            return None;
+        }
+        let location = take_co_string(location);
+        let mut icon = 0;
+        if ExtractIconExW(wide(&location).as_ptr(), index, std::ptr::null_mut(), &mut icon, 1) == 0 || icon == 0 {
+            return None;
+        }
+        let png = super::icon_rgba(icon).and_then(|(width, height, rgba)| super::rgba_png(width, height, rgba));
+        DestroyIcon(icon);
+        png.map(|bytes| format!("data:image/png;base64,{}", super::base64_encode(&bytes)))
+    }
+
+    // Walks the recommended IAssocHandlers for the file's extension, stopping once `visit` returns false.
+    fn for_each_handler(path: &str, mut visit: impl FnMut(*mut c_void) -> bool) {
+        let Some(extension) = std::path::Path::new(path).extension() else { return };
+        let extension = format!(".{}", extension.to_string_lossy());
+        let mut enumerator = std::ptr::null_mut();
+        if unsafe { SHAssocEnumHandlers(wide(&extension).as_ptr(), ASSOC_FILTER_RECOMMENDED, &mut enumerator) } < 0 || enumerator.is_null() {
+            return;
+        }
+        unsafe {
+            // IEnumAssocHandlers::Next
+            let next: extern "system" fn(*mut c_void, u32, *mut *mut c_void, *mut u32) -> i32 = std::mem::transmute(method(enumerator, 3));
+            loop {
+                let mut handler = std::ptr::null_mut();
+                let mut fetched = 0;
+                if next(enumerator, 1, &mut handler, &mut fetched) != 0 || fetched == 0 || handler.is_null() {
+                    break;
+                }
+                let keep_going = visit(handler);
+                release(handler);
+                if !keep_going {
+                    break;
+                }
+            }
+            release(enumerator);
+        }
+    }
+
+    // Called from a worker thread, which needs COM set up before the shell will talk to it.
+    pub fn open_with_apps(path: &str) -> Vec<super::OpenWithApp> {
+        unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+        let mut apps = Vec::new();
+        for_each_handler(path, |handler| {
+            // IAssocHandler::GetName (slot 3) is the app's path or id; GetUIName (slot 4) its display name.
+            if let (Some(id), Some(name)) = unsafe { (handler_string(handler, 3), handler_string(handler, 4)) } {
+                let icon = unsafe { handler_icon(handler) };
+                apps.push(super::OpenWithApp { id, name, icon });
+            }
+            true
+        });
+        apps
+    }
+
+    pub fn open_with(path: &str, app_id: &str) -> Result<(), String> {
+        let mut result = Err("That app is no longer registered for this file type".to_string());
+        for_each_handler(path, |handler| {
+            if unsafe { handler_string(handler, 3) }.as_deref() != Some(app_id) {
+                return true;
+            }
+            result = with_data_object(&[path.to_string()], |data_object| {
+                // IAssocHandler::Invoke
+                let invoke: extern "system" fn(*mut c_void, *mut c_void) -> i32 = unsafe { std::mem::transmute(method(handler, 8)) };
+                let hr = invoke(handler, data_object);
+                if hr < 0 {
+                    return Err(format!("Couldn't start the app (HRESULT {hr:#x})"));
+                }
+                Ok(())
+            });
+            false
+        });
+        result
     }
 }
 
@@ -1049,6 +1324,26 @@ mod paste_entries_tests {
     }
 
     #[test]
+    fn compress_zips_files_and_folders_into_an_archive_named_after_the_first() {
+        let sandbox = Sandbox::new("compress");
+        fs::write(sandbox.path("notes.txt"), "hello").unwrap();
+        fs::create_dir_all(sandbox.path("photos/empty")).unwrap();
+        fs::write(sandbox.path("photos/cat.jpg"), "meow").unwrap();
+        let paths = vec![sandbox.path("notes.txt").to_string_lossy().to_string(), sandbox.path("photos").to_string_lossy().to_string()];
+        let archive = compress(&paths).unwrap();
+        assert_eq!(archive, sandbox.path("notes.zip").to_string_lossy().to_string());
+        let mut zip = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+        let mut names: Vec<String> = zip.file_names().map(|name| name.unwrap().to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["notes.txt", "photos/", "photos/cat.jpg", "photos/empty/"]);
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("photos/cat.jpg").unwrap(), &mut contents).unwrap();
+        assert_eq!(contents, "meow");
+        // A second archive of the same item gets a fresh name instead of overwriting the first.
+        assert_eq!(compress(&paths).unwrap(), sandbox.path("notes 2.zip").to_string_lossy().to_string());
+    }
+
+    #[test]
     fn paste_skips_folder_into_itself_or_its_subfolder() {
         let sandbox = Sandbox::new("paste-into-self");
         fs::create_dir_all(sandbox.path("a").join("sub")).unwrap();
@@ -1392,10 +1687,6 @@ fn extract_extension_icon_rgba(extension: &str) -> Option<(u32, u32, Vec<u8>)> {
     const SHGFI_SMALLICON: u32 = 0x1;
     const SHGFI_USEFILEATTRIBUTES: u32 = 0x10;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-    const DIB_RGB_COLORS: u32 = 0;
-    const DI_NORMAL: u32 = 0x3;
-    const BI_RGB: u32 = 0;
-    const ICON_SIZE: i32 = 16;
 
     #[repr(C)]
     struct ShFileInfoW {
@@ -1405,6 +1696,35 @@ fn extract_extension_icon_rgba(extension: &str) -> Option<(u32, u32, Vec<u8>)> {
         sz_display_name: [u16; 260],
         sz_type_name: [u16; 80],
     }
+
+    extern "system" {
+        fn SHGetFileInfoW(path: *const u16, attrs: u32, info: *mut ShFileInfoW, size: u32, flags: u32) -> isize;
+        fn DestroyIcon(icon: isize) -> i32;
+    }
+
+    let dummy_name = format!("dummy{}", extension);
+    let wide: Vec<u16> = OsStr::new(&dummy_name).encode_wide().chain(Some(0)).collect();
+
+    let mut info = ShFileInfoW { h_icon: 0, i_icon: 0, dw_attributes: 0, sz_display_name: [0; 260], sz_type_name: [0; 80] };
+    let result = unsafe {
+        SHGetFileInfoW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL, &mut info, std::mem::size_of::<ShFileInfoW>() as u32, SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES)
+    };
+    if result == 0 || info.h_icon == 0 {
+        return None;
+    }
+    let rgba = icon_rgba(info.h_icon);
+    unsafe { DestroyIcon(info.h_icon) };
+    rgba
+}
+
+// Draws an HICON at 16x16 and returns its pixels as RGBA. The caller still owns the icon.
+#[cfg(windows)]
+fn icon_rgba(h_icon: isize) -> Option<(u32, u32, Vec<u8>)> {
+    const DIB_RGB_COLORS: u32 = 0;
+    const DI_NORMAL: u32 = 0x3;
+    const BI_RGB: u32 = 0;
+    const ICON_SIZE: i32 = 16;
+
     #[repr(C)]
     struct BitmapInfoHeader {
         bi_size: u32,
@@ -1426,8 +1746,6 @@ fn extract_extension_icon_rgba(extension: &str) -> Option<(u32, u32, Vec<u8>)> {
     }
 
     extern "system" {
-        fn SHGetFileInfoW(path: *const u16, attrs: u32, info: *mut ShFileInfoW, size: u32, flags: u32) -> isize;
-        fn DestroyIcon(icon: isize) -> i32;
         fn CreateCompatibleDC(hdc: isize) -> isize;
         fn DeleteDC(hdc: isize) -> i32;
         fn CreateDIBSection(hdc: isize, info: *const BitmapInfo, usage: u32, bits: *mut *mut u8, section: isize, offset: u32) -> isize;
@@ -1436,20 +1754,8 @@ fn extract_extension_icon_rgba(extension: &str) -> Option<(u32, u32, Vec<u8>)> {
         fn DrawIconEx(hdc: isize, x: i32, y: i32, icon: isize, width: i32, height: i32, frame: u32, flicker_brush: isize, flags: u32) -> i32;
     }
 
-    let dummy_name = format!("dummy{}", extension);
-    let wide: Vec<u16> = OsStr::new(&dummy_name).encode_wide().chain(Some(0)).collect();
-
-    let mut info = ShFileInfoW { h_icon: 0, i_icon: 0, dw_attributes: 0, sz_display_name: [0; 260], sz_type_name: [0; 80] };
-    let result = unsafe {
-        SHGetFileInfoW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL, &mut info, std::mem::size_of::<ShFileInfoW>() as u32, SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES)
-    };
-    if result == 0 || info.h_icon == 0 {
-        return None;
-    }
-
     let hdc = unsafe { CreateCompatibleDC(0) };
     if hdc == 0 {
-        unsafe { DestroyIcon(info.h_icon) };
         return None;
     }
 
@@ -1473,10 +1779,7 @@ fn extract_extension_icon_rgba(extension: &str) -> Option<(u32, u32, Vec<u8>)> {
     let mut bits_ptr: *mut u8 = std::ptr::null_mut();
     let bitmap = unsafe { CreateDIBSection(hdc, &bitmap_info, DIB_RGB_COLORS, &mut bits_ptr, 0, 0) };
     if bitmap == 0 || bits_ptr.is_null() {
-        unsafe {
-            DeleteDC(hdc);
-            DestroyIcon(info.h_icon);
-        }
+        unsafe { DeleteDC(hdc) };
         return None;
     }
 
@@ -1484,7 +1787,7 @@ fn extract_extension_icon_rgba(extension: &str) -> Option<(u32, u32, Vec<u8>)> {
     let previous = unsafe { SelectObject(hdc, bitmap) };
     unsafe {
         std::ptr::write_bytes(bits_ptr, 0, buffer_len);
-        DrawIconEx(hdc, 0, 0, info.h_icon, ICON_SIZE, ICON_SIZE, 0, 0, DI_NORMAL);
+        DrawIconEx(hdc, 0, 0, h_icon, ICON_SIZE, ICON_SIZE, 0, 0, DI_NORMAL);
     }
 
     let mut rgba = vec![0u8; buffer_len];
@@ -1497,7 +1800,6 @@ fn extract_extension_icon_rgba(extension: &str) -> Option<(u32, u32, Vec<u8>)> {
         SelectObject(hdc, previous);
         DeleteObject(bitmap);
         DeleteDC(hdc);
-        DestroyIcon(info.h_icon);
     }
 
     Some((ICON_SIZE as u32, ICON_SIZE as u32, rgba))
@@ -1506,6 +1808,11 @@ fn extract_extension_icon_rgba(extension: &str) -> Option<(u32, u32, Vec<u8>)> {
 #[cfg(windows)]
 fn extension_icon_png(extension: &str) -> Option<Vec<u8>> {
     let (width, height, rgba) = extract_extension_icon_rgba(extension)?;
+    rgba_png(width, height, rgba)
+}
+
+#[cfg(windows)]
+fn rgba_png(width: u32, height: u32, rgba: Vec<u8>) -> Option<Vec<u8>> {
     let image = image::RgbaImage::from_raw(width, height, rgba)?;
     let mut bytes = Vec::new();
     image::DynamicImage::ImageRgba8(image)
@@ -1519,14 +1826,22 @@ fn extension_icon_png(extension: &str) -> Option<Vec<u8>> {
 // iconForFileType: takes the extension directly and still works.
 #[cfg(target_os = "macos")]
 fn extension_icon_png(extension: &str) -> Option<Vec<u8>> {
-    use objc2::AnyThread;
-    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSGraphicsContext, NSWorkspace};
-    use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::NSString;
 
-    const ICON_PIXELS: isize = 32;
     let file_type = NSString::from_str(extension.trim_start_matches('.'));
     #[allow(deprecated)]
     let image = NSWorkspace::sharedWorkspace().iconForFileType(&file_type);
+    image_png(&image)
+}
+
+#[cfg(target_os = "macos")]
+fn image_png(image: &objc2_app_kit::NSImage) -> Option<Vec<u8>> {
+    use objc2::AnyThread;
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSGraphicsContext};
+    use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize};
+
+    const ICON_PIXELS: isize = 32;
     let rep = unsafe {
         NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
             NSBitmapImageRep::alloc(), std::ptr::null_mut(), ICON_PIXELS, ICON_PIXELS, 8, 4, true, false, NSDeviceRGBColorSpace, 0, 0,
@@ -1577,7 +1892,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }

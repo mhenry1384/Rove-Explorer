@@ -52,3 +52,16 @@ html, body, #app { height: 100%; overflow: hidden; }
 .move-button:disabled .move-icon-file { fill: none; }
 .topbar, .folder-toolbar { -webkit-user-select: none; user-select: none; }.location-input { -webkit-user-select: text; user-select: text; }
 .sort-header { display: flex; align-items: center; gap: 4px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-align: left; cursor: pointer; }.sort-header:hover { color: var(--ink); }.sort-arrow { font-size: 7px; opacity: .55; }
+.details-wrap { scroll-padding-top: 40px; }
+.details-wrap .table-head { position: sticky; top: 0; z-index: 1; background: var(--panel); }
+.pane:not(.is-active) .details-wrap .table-head { background: #ebebe4; }
+.context-submenu-parent { position: relative; }
+.context-menu .context-submenu-trigger { display: flex; justify-content: space-between; gap: 16px; }
+.context-submenu { display: none; position: absolute; top: -5px; left: 100%; min-width: 200px; max-width: 260px; max-height: 70vh; overflow-y: auto; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 10px 30px rgba(36,38,35,.18); padding: 4px; }
+.context-submenu.is-leftward { left: auto; right: 100%; }
+.context-submenu-parent:hover > .context-submenu { display: block; }
+.context-submenu-parent:hover > .context-submenu-trigger { background: #f2f4e5; }
+.context-menu .context-submenu button { display: flex; align-items: center; gap: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.context-submenu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
+.menu-icon { width: 16px; height: 16px; flex: 0 0 auto; object-fit: contain; }
+.context-menu button:disabled { color: var(--muted); cursor: default; background: transparent; }

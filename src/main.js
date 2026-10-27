@@ -284,7 +284,38 @@ const SHORTCUT_HINTS = isMac
 // Characters the OS won't accept in a file name (macOS reserves ':' because Finder displays it as '/').
 const INVALID_NAME_CHARS = isWindows ? /[\\/:*?"<>|]/ : isMac ? /[/:]/ : /\//;
 function textEditorLabel() { return platformName === 'macos' ? 'Edit in TextEdit' : 'Edit in Notepad'; }
-function canEditInTextEditor(pane) { return (platformName === 'windows' || platformName === 'macos') && selectedFileEntries(pane).some((entry) => entry.kind === 'file'); }
+const TEXT_EDITOR_EXTENSIONS = new Set(['.txt', '.md', '.lst']);
+function canEditInTextEditor(pane) {
+  const entries = selectedFileEntries(pane);
+  return (platformName === 'windows' || platformName === 'macos') && entries.length > 0 && entries.every((entry) => entry.kind === 'file' && TEXT_EDITOR_EXTENSIONS.has(extension(entry.name).toLowerCase()));
+}
+const OPEN_WITH_OTHER_LABEL = isMac ? 'Other…' : 'Choose another app';
+const SUBMENU_WIDTH_PX = 260;
+
+// Open With is offered for a single selected file; the apps for its type load while the menu is open.
+function loadOpenWithApps(menu) {
+  const entries = selectedFileEntries(menu.pane);
+  if (!(platformName === 'windows' || platformName === 'macos') || entries.length !== 1 || entries[0].kind !== 'file') return;
+  menu.openWith = { path: entries[0].path, apps: null };
+  invoke('list_open_with_apps', { path: entries[0].path })
+    .catch(() => [])
+    .then((apps) => { menu.openWith.apps = apps; if (state.contextMenu === menu) render(); });
+}
+
+function renderOpenWith(menu) {
+  if (!menu.openWith) return '';
+  const apps = menu.openWith.apps === null ? '<button disabled>Loading…</button>' : menu.openWith.apps.map((app, appIndex) => `<button data-open-with-app="${appIndex}">${app.icon ? `<img class="menu-icon" src="${escapeAttribute(app.icon)}" alt="">` : '<span class="menu-icon"></span>'}${escapeAttribute(app.name)}</button>`).join('');
+  // Open the submenu leftward when there isn't room for it to the right of the menu.
+  const leftward = menu.x + 150 + SUBMENU_WIDTH_PX > window.innerWidth;
+  return `<div class="context-submenu-parent"><button class="context-submenu-trigger">Open With<span aria-hidden="true">▸</span></button><div class="context-submenu ${leftward ? 'is-leftward' : ''}">${apps}${apps ? '<hr>' : ''}<button data-open-with-other>${OPEN_WITH_OTHER_LABEL}</button></div></div>`;
+}
+
+function openWith(menu, command, args) {
+  const { path } = menu.openWith;
+  state.contextMenu = null;
+  render();
+  invoke(command, { path, ...args }).catch((error) => message(String(error), { title: 'Open With failed', kind: 'error' }));
+}
 
 // What a context menu's Properties item describes: the clicked selection, the clicked tree folder,
 // or (for a right-click on empty space) the folder the pane is showing.
@@ -309,7 +340,7 @@ function renderContextMenu() {
   const renameable = kind === 'file' && tab?.entries.find((entry) => entry.id === state.contextMenu.entryId)?.kind !== 'drive';
   const items = kind === 'pane'
     ? `${tab?.path ? '<button data-context-new-folder>New Folder</button><button data-context-new-file>New File</button>' : ''}<button data-context-paste>Paste</button>${properties}`
-    : `${kind === 'file' ? `<button data-context-copy>Copy</button><button data-context-cut>Cut</button>${renameable ? '<button data-context-rename>Rename</button>' : ''}${canEditInTextEditor(pane) ? `<button data-context-edit-notepad>${textEditorLabel()}</button>` : ''}` : ''}<button class="danger" data-context-delete>Delete</button>${properties}`;
+    : `${kind === 'file' ? `${renderOpenWith(state.contextMenu)}<button data-context-copy>Copy</button><button data-context-cut>Cut</button>${renameable ? '<button data-context-rename>Rename</button>' : ''}${canEditInTextEditor(pane) ? `<button data-context-edit-notepad>${textEditorLabel()}</button>` : ''}${tab?.path ? '<button data-context-compress>Compress</button>' : ''}` : ''}<button class="danger" data-context-delete>Delete</button>${properties}`;
   return `<div class="context-menu" data-context-menu style="left:${x}px; top:${y}px">${items}</div>`;
 }
 
@@ -575,6 +606,29 @@ async function editSelectedInTextEditor(index) {
   render();
   if (!entries.length) return;
   await invoke('edit_in_text_editor', { paths: entries.map((entry) => entry.path) }).catch((error) => console.error('edit_in_text_editor failed', error));
+}
+
+// Zips the selection into a new archive in the same folder, then starts renaming it as Explorer does.
+async function compressSelected(index, entryId) {
+  const tab = currentTab(state.panes[index]);
+  const entries = selectedFileEntries(index);
+  state.contextMenu = null;
+  render();
+  if (!tab?.path || !entries.length) return;
+  const folderPath = tab.path;
+  // The archive is named after the first path, so put the right-clicked item first.
+  const ordered = [...entries.filter((entry) => entry.id === entryId), ...entries.filter((entry) => entry.id !== entryId)];
+  let archivePath;
+  try { archivePath = await invoke('compress_entries', { paths: ordered.map((entry) => entry.path) }); } catch (error) { await message(String(error), { title: 'Compress failed', kind: 'error' }); return; }
+  // Skip selecting the archive if the pane has moved on while it was being written.
+  if (currentTab(state.panes[index]) !== tab || tab.path !== folderPath) return;
+  tab.entries = await load(tab.path);
+  const entry = tab.entries.find((item) => item.path === archivePath);
+  if (!entry) { render(); return; }
+  selectSingle(tab, entry.id);
+  saveSession();
+  scrollSelectionIntoView = true;
+  startRename(index, entry);
 }
 
 async function startEntryDrag(index, entry) {
@@ -974,6 +1028,7 @@ function bindEvents() {
         state.activePane = index;
         if (!(tab.selected || []).includes(entry.id)) { selectSingle(tab, entry.id); if (tab.path) remember(tab.path, entry.name); }
         state.contextMenu = { pane: index, kind: 'file', entryId: entry.id, x: event.clientX, y: event.clientY };
+        loadOpenWithApps(state.contextMenu);
         render();
       });
       // Drags are started from pointermove (see pendingPress); keep the browser's own drag (e.g. of a thumbnail image) out of the way.
@@ -1059,6 +1114,9 @@ function bindEvents() {
   document.querySelector('[data-context-new-folder]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) createNewEntry(menu.pane, 'create_folder'); });
   document.querySelector('[data-context-properties]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) showProperties(menu); });
   document.querySelector('[data-context-edit-notepad]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) editSelectedInTextEditor(menu.pane); });
+  document.querySelector('[data-context-compress]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) compressSelected(menu.pane, menu.entryId); });
+  document.querySelectorAll('[data-open-with-app]').forEach((button) => button.addEventListener('click', () => { const menu = state.contextMenu; const app = menu?.openWith?.apps?.[Number(button.dataset.openWithApp)]; if (app) openWith(menu, 'open_with_app', { appId: app.id }); }));
+  document.querySelector('[data-open-with-other]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu?.openWith) openWith(menu, 'open_with_other_app', {}); });
 }
 
 document.addEventListener('keydown', (event) => {
