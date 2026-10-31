@@ -46,7 +46,50 @@ function extension(name) { const dot = name.lastIndexOf('.'); return dot > 0 ? n
 function displayName(name) { const dot = name.lastIndexOf('.'); return dot > 0 ? name.slice(0, dot) : name; }
 function icon(kind) { return kind === 'folder' || kind === 'drive' ? '<span class="folder-icon">▰</span>' : '<span class="file-icon">·</span>'; }
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico', '.avif']);
-function isImageFile(name) { return IMAGE_EXTENSIONS.has(extension(name).toLowerCase()); }
+// macOS's WebKit shows HEIC and video frames directly; WebView2 can't, so on Windows the backend makes those thumbnails.
+const HEIC_EXTENSIONS = new Set(['.heic', '.heif']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov']);
+function isImageFile(name) { const ext = extension(name).toLowerCase(); return IMAGE_EXTENSIONS.has(ext) || (isMac && HEIC_EXTENSIONS.has(ext)); }
+function backendThumbCommand(name) {
+  if (!isWindows) return null;
+  const ext = extension(name).toLowerCase();
+  return HEIC_EXTENSIONS.has(ext) ? 'get_heic_thumbnail' : VIDEO_EXTENSIONS.has(ext) ? 'get_video_thumbnail' : null;
+}
+// Keyed by path and modified time so an edited file gets a fresh thumbnail. Thumbnails are made one at a time, in listing order.
+const backendThumbCache = new Map();
+const backendThumbQueue = [];
+let backendThumbBusy = false;
+function backendThumbElements(key) { return document.querySelectorAll(`[data-backend-thumb="${CSS.escape(key)}"]`); }
+function pumpBackendThumbs() {
+  if (backendThumbBusy) return;
+  const next = backendThumbQueue.shift();
+  if (!next) return;
+  // Skip files that are no longer on screen (e.g. the folder changed); they're queued again if they come back.
+  if (!backendThumbElements(next.key).length) { backendThumbCache.delete(next.key); pumpBackendThumbs(); return; }
+  backendThumbBusy = true;
+  invoke(next.command, { path: next.path }).catch(() => null).then((dataUri) => {
+    backendThumbCache.set(next.key, dataUri || 'none');
+    if (dataUri) backendThumbElements(next.key).forEach((el) => { el.outerHTML = `<img class="thumb-img" src="${escapeAttribute(dataUri)}" alt="">`; });
+    backendThumbBusy = false;
+    pumpBackendThumbs();
+  });
+}
+function renderThumbImage(entry) {
+  if (entry.kind !== 'file') return icon(entry.kind);
+  const command = backendThumbCommand(entry.name);
+  if (command) {
+    const key = `${entry.path}|${entry.modified}`;
+    const cached = backendThumbCache.get(key);
+    if (cached === 'none') return icon(entry.kind);
+    if (cached) return `<img class="thumb-img" src="${escapeAttribute(cached)}" alt="">`;
+    // The pump runs after render() has put the placeholder in the DOM.
+    if (!backendThumbCache.has(key)) { backendThumbCache.set(key, null); backendThumbQueue.push({ key, command, path: entry.path }); queueMicrotask(pumpBackendThumbs); }
+    return `<span class="file-icon" data-backend-thumb="${escapeAttribute(key)}">·</span>`;
+  }
+  // A frame a second in rather than the very first one, which is often black.
+  if (VIDEO_EXTENSIONS.has(extension(entry.name).toLowerCase())) return `<video class="thumb-img" src="${escapeAttribute(convertFileSrc(entry.path))}#t=1" preload="metadata" muted playsinline></video>`;
+  return isImageFile(entry.name) ? `<img class="thumb-img" src="${escapeAttribute(convertFileSrc(entry.path))}" alt="" loading="lazy">` : icon(entry.kind);
+}
 const extensionIconCache = new Map();
 function fetchExtensionIcon(ext) {
   extensionIconCache.set(ext, null);
@@ -401,9 +444,7 @@ function renderThumbnails(entries, selected, focusId, index) {
   if (!entries.length) return '<div class="empty-state"><span>⌁</span><strong>This folder is empty</strong><small>Choose another location to keep moving.</small></div>';
   const cards = entries.map((entry, entryIndex) => {
     const editing = isEditing(index, entry);
-    const thumb = entry.kind === 'file' && isImageFile(entry.name)
-      ? `<img class="thumb-img" src="${escapeAttribute(convertFileSrc(entry.path))}" alt="" loading="lazy">`
-      : icon(entry.kind);
+    const thumb = renderThumbImage(entry);
     const label = editing
       ? `<input class="rename-input thumb-rename" data-rename value="${escapeAttribute(entry.name)}" aria-label="Rename">`
       : `<span class="thumb-name">${escapeAttribute(entry.displayName)}</span>`;

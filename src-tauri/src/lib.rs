@@ -1902,6 +1902,166 @@ fn get_extension_icon(_state: State<IconCacheState>, _extension: String) -> Opti
     None
 }
 
+// Long edge of a generated thumbnail in pixels: covers the 150px thumbnail box at 2x display scaling.
+#[cfg(windows)]
+const THUMB_MAX_DIM: u32 = 300;
+// Concurrent WIC decodes can crash the process, so HEIC thumbnails are made one at a time.
+#[cfg(windows)]
+static HEIC_DECODE_LOCK: Mutex<()> = Mutex::new(());
+
+// WebView2 can't render HEIC, so Windows decodes it with the Windows Imaging Component (which needs
+// the "HEIF Image Extensions" codec) and hands back a small JPEG as a data URI.
+#[cfg(windows)]
+#[tauri::command]
+async fn get_heic_thumbnail(path: String) -> Option<String> {
+    let jpeg = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = HEIC_DECODE_LOCK.lock().ok()?;
+        heic_thumbnail_jpeg(&path).ok()
+    }).await.ok().flatten()?;
+    Some(format!("data:image/jpeg;base64,{}", base64_encode(&jpeg)))
+}
+
+// macOS's WebKit renders HEIC itself, so the frontend never asks for these there.
+#[cfg(not(windows))]
+#[tauri::command]
+async fn get_heic_thumbnail(_path: String) -> Option<String> {
+    None
+}
+
+// Video thumbnails come from the shell, so they match what Windows Explorer shows (and use its cache).
+#[cfg(windows)]
+#[tauri::command]
+async fn get_video_thumbnail(path: String) -> Option<String> {
+    let jpeg = tauri::async_runtime::spawn_blocking(move || shell_thumbnail_jpeg(&path).ok()).await.ok().flatten()?;
+    Some(format!("data:image/jpeg;base64,{}", base64_encode(&jpeg)))
+}
+
+// macOS's WebKit draws video frames itself, so the frontend never asks for these there.
+#[cfg(not(windows))]
+#[tauri::command]
+async fn get_video_thumbnail(_path: String) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn shell_thumbnail_jpeg(path: &str) -> Result<Vec<u8>, String> {
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::SIZE,
+            Graphics::Gdi::{DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS},
+            System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
+            UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY},
+        },
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let path_wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let factory: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR::from_raw(path_wide.as_ptr()), None)
+            .map_err(|e| format!("Shell item failed: {e}"))?;
+        // THUMBNAILONLY: a file with no thumbnail should fail rather than come back as its icon.
+        let size = SIZE { cx: THUMB_MAX_DIM as i32, cy: THUMB_MAX_DIM as i32 };
+        let bitmap = factory
+            .GetImage(size, SIIGBF_THUMBNAILONLY)
+            .map_err(|e| format!("Thumbnail failed: {e}"))?;
+
+        let mut info = BITMAP::default();
+        let read = GetObjectW(bitmap.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut info as *mut BITMAP as *mut _));
+        let (width, height) = (info.bmWidth, info.bmHeight.abs());
+        let mut pixels = vec![0u8; (width.max(0) * height * 4) as usize];
+        let mut header = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height, // negative: rows top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lines = if read == 0 || width <= 0 || height <= 0 {
+            0
+        } else {
+            let dc = GetDC(None);
+            let lines = GetDIBits(dc, bitmap, 0, height as u32, Some(pixels.as_mut_ptr() as *mut _), &mut header, DIB_RGB_COLORS);
+            ReleaseDC(None, dc);
+            lines
+        };
+        let _ = DeleteObject(bitmap.into());
+        if lines == 0 {
+            return Err("Reading thumbnail pixels failed".to_string());
+        }
+
+        // BGRA from GDI -> RGB for the JPEG encoder.
+        let rgb: Vec<u8> = pixels.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+        let image = image::RgbImage::from_raw(width as u32, height as u32, rgb).ok_or("Failed to construct image from pixel data")?;
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .map_err(|e| format!("JPEG encode failed: {e}"))?;
+        Ok(bytes)
+    }
+}
+
+#[cfg(windows)]
+fn heic_thumbnail_jpeg(path: &str) -> Result<Vec<u8>, String> {
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::GENERIC_READ,
+            Graphics::Imaging::{
+                CLSID_WICImagingFactory, IWICBitmapScaler, IWICFormatConverter, IWICImagingFactory,
+                WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeMedianCut,
+                WICDecodeMetadataCacheOnDemand, WICRect, GUID_WICPixelFormat24bppBGR,
+            },
+            System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED},
+        },
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| format!("WIC init failed: {e}"))?;
+        let path_wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let decoder = factory
+            .CreateDecoderFromFilename(PCWSTR::from_raw(path_wide.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
+            .map_err(|e| format!("HEIC decode failed (HEIF Image Extensions required): {e}"))?;
+        let frame = decoder.GetFrame(0).map_err(|e| format!("Frame read failed: {e}"))?;
+
+        let (mut orig_w, mut orig_h) = (0u32, 0u32);
+        frame.GetSize(&mut orig_w, &mut orig_h).map_err(|e| format!("GetSize failed: {e}"))?;
+        let scale = (THUMB_MAX_DIM as f64 / orig_w.max(orig_h).max(1) as f64).min(1.0);
+        let out_w = ((orig_w as f64 * scale).round() as u32).max(1);
+        let out_h = ((orig_h as f64 * scale).round() as u32).max(1);
+
+        let scaler: IWICBitmapScaler = factory.CreateBitmapScaler().map_err(|e| format!("Scaler create failed: {e}"))?;
+        scaler.Initialize(&frame, out_w, out_h, WICBitmapInterpolationModeFant).map_err(|e| format!("Scaler init failed: {e}"))?;
+        let converter: IWICFormatConverter = factory.CreateFormatConverter().map_err(|e| format!("Format converter failed: {e}"))?;
+        converter
+            .Initialize(&scaler, &GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)
+            .map_err(|e| format!("Converter init failed: {e}"))?;
+
+        let stride = out_w * 3;
+        let mut buffer = vec![0u8; (stride * out_h) as usize];
+        let rect = WICRect { X: 0, Y: 0, Width: out_w as i32, Height: out_h as i32 };
+        converter.CopyPixels(&rect, stride, &mut buffer).map_err(|e| format!("CopyPixels failed: {e}"))?;
+        // WIC hands back BGR; the image crate wants RGB.
+        for pixel in buffer.chunks_exact_mut(3) {
+            pixel.swap(0, 2);
+        }
+
+        let image = image::RgbImage::from_raw(out_w, out_h, buffer).ok_or("Failed to construct image from pixel data")?;
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .map_err(|e| format!("JPEG encode failed: {e}"))?;
+        Ok(bytes)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -1915,7 +2075,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }
