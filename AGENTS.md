@@ -2,8 +2,10 @@
 
 ## Release Builds
 
-- Every release build gets a new version number. Bump the rightmost digit (e.g. 0.4.0 -> 0.4.1) in
-  `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`.
+- Before every release build, check `git status`. If there are uncommitted changes, bump the
+  version number first: increment the rightmost digit (e.g. 0.4.0 -> 0.4.1) in `package.json`,
+  `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`. If the working tree is clean, keep the
+  current version.
 - Build with `npm run tauri build`.
 - On macOS: do not build or package a DMG during a release build unless the user explicitly asks
   for one. Build the app bundle only (`npm run tauri build -- --bundles app`).
