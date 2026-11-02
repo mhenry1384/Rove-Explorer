@@ -8,7 +8,7 @@ A focused, dual-pane file explorer built with [Tauri](https://tauri.app) (Rust) 
 - Configurable list of favorite/pinned folders (`config/folders.json`)
 - Drive listing (Windows drives / mounted volumes)
 - Live directory watching — panes refresh automatically when the filesystem changes
-- Rename, delete (to trash), and open files/folders
+- Rename, delete (to trash, with up to five levels of undo), and open files/folders
 - Folder size / item-count statistics computed recursively, with cancellation support
 - File type icons from the OS shell (Windows Explorer / Finder) with graceful fallback
 - Copy/cut/paste shares the system clipboard with Explorer and Finder
@@ -52,9 +52,9 @@ npm run tauri build
 
 A Mac build has to be made on a Mac. Install the Xcode command line tools (`xcode-select --install`), Rust and Node, then use the same commands as above; `npm run tauri build` produces a `.app` and a `.dmg` under `src-tauri/target/release/bundle/`. For one app that runs on both Apple Silicon and Intel, run `rustup target add x86_64-apple-darwin aarch64-apple-darwin` and build with `npm run tauri build -- --target universal-apple-darwin`.
 
-The build is unsigned, so the first launch is blocked by Gatekeeper: right-click the app and choose **Open**, or run `xattr -cr "Rove Explorer.app"`. macOS then asks for access to Desktop/Documents/Downloads the first time each is opened, and for permission to control Finder the first time an item is moved to the Trash or Get Info is used.
+The build is unsigned, so the first launch is blocked by Gatekeeper: right-click the app and choose **Open**, or run `xattr -cr "Rove Explorer.app"`. macOS then asks for access to Desktop/Documents/Downloads the first time each is opened, and for permission to control Finder the first time Get Info is used.
 
-On a Mac the shortcuts follow Finder: ⌘⌫ moves to the Trash, ⌘[ / ⌘] go back and forward, ⌘↑ goes up a level and ⌘↓ opens.
+On a Mac the shortcuts follow Finder: ⌘⌫ moves to the Trash, ⌘[ / ⌘] go back and forward, ⌘↑ goes up a level and ⌘↓ opens. **Help → Keyboard Shortcuts** (or F1) lists them all.
 
 Other scripts:
 

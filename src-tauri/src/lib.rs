@@ -1,5 +1,5 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -249,14 +249,64 @@ fn readable_rename_error(error: &std::io::Error, is_dir: bool) -> String {
     }
 }
 
+// One thing that went to the trash. `id` is where it sits now on Windows (a $R item in the Recycle
+// Bin) and macOS, and its .trashinfo file elsewhere; `original` is where it came from.
+#[derive(Serialize, Deserialize, Debug)]
+struct TrashedItem {
+    id: String,
+    original: String,
+}
+
+// A deleted path and what Undo needs to put it back. On Windows the trash crate recycles a folder's
+// files one by one and then the (by then empty) folder, so a folder brings several items. `items` is
+// empty when nothing could be found (e.g. a drive without a Recycle Bin deletes outright).
+#[derive(Serialize, Deserialize)]
+struct TrashedEntry {
+    path: String,
+    items: Vec<TrashedItem>,
+}
+
+#[derive(Serialize)]
+struct DeleteFailure {
+    path: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct DeleteOutcome {
+    trashed: Vec<TrashedEntry>,
+    failures: Vec<DeleteFailure>,
+}
+
+#[cfg(windows)]
+const TRASH_NAME: &str = "Recycle Bin";
+#[cfg(not(windows))]
+const TRASH_NAME: &str = "Trash";
+
 #[tauri::command]
-fn delete_entry(path: String) -> Result<(), String> {
-    trash::delete(&path).map_err(readable_trash_error)?;
+fn delete_entries(paths: Vec<String>) -> DeleteOutcome {
+    // Deletion times are kept in whole seconds, so allow some slack.
+    #[cfg(not(target_os = "macos"))]
+    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|time| time.as_secs() as i64).unwrap_or(0) - 2;
+    let mut outcome = DeleteOutcome { trashed: Vec::new(), failures: Vec::new() };
+    for path in paths {
+        match delete_entry(path.clone()) {
+            Ok(items) => outcome.trashed.push(TrashedEntry { path, items }),
+            Err(error) => outcome.failures.push(DeleteFailure { path, error }),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    find_trashed_items(&mut outcome.trashed, started);
+    outcome
+}
+
+fn delete_entry(path: String) -> Result<Vec<TrashedItem>, String> {
+    let items = move_to_trash(&path)?;
     // The shell recycles silently: an item that is in use is skipped yet the operation still
     // reports success, so check what is left behind. Whatever survived inside a folder is what
     // the other program has open (everything else already went to the Recycle Bin).
     let target = Path::new(&path);
-    if !target.exists() { return Ok(()); }
+    if !target.exists() { return Ok(items); }
     let mut remaining = Vec::new();
     if target.is_dir() { collect_files(target, target, &mut remaining); }
     if remaining.is_empty() {
@@ -265,6 +315,102 @@ fn delete_entry(path: String) -> Result<(), String> {
     let shown = remaining.iter().take(5).map(|name| format!("  {name}")).collect::<Vec<_>>().join("\n");
     let more = if remaining.len() > 5 { format!("\n  ...and {} more", remaining.len() - 5) } else { String::new() };
     Err(format!("These items inside it are being used by another program:\n{shown}{more}"))
+}
+
+// The trashed items are looked up afterwards by find_trashed_items, once for the whole batch, since
+// listing the trash is slow.
+#[cfg(not(target_os = "macos"))]
+fn move_to_trash(path: &str) -> Result<Vec<TrashedItem>, String> {
+    trash::delete(path).map_err(readable_trash_error)?;
+    Ok(Vec::new())
+}
+
+// NSFileManager, unlike the trash crate's Finder route, reports where the item landed in the Trash.
+#[cfg(target_os = "macos")]
+fn move_to_trash(path: &str) -> Result<Vec<TrashedItem>, String> {
+    use objc2_foundation::{NSFileManager, NSString, NSURL};
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+    let mut resulting_url = None;
+    NSFileManager::defaultManager()
+        .trashItemAtURL_resultingItemURL_error(&url, Some(&mut resulting_url))
+        .map_err(|error| error.localizedDescription().to_string())?;
+    let id = resulting_url.and_then(|url| url.path()).map(|path| path.to_string());
+    Ok(id.map(|id| TrashedItem { id, original: path.to_string() }).into_iter().collect())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn find_trashed_items(trashed: &mut [TrashedEntry], started: i64) {
+    if trashed.is_empty() { return; }
+    let Ok(items) = trash::os_limited::list() else { return };
+    for entry in trashed.iter_mut() {
+        let root = comparable_path(Path::new(&entry.path));
+        let inside = format!("{root}{}", std::path::MAIN_SEPARATOR);
+        // Anything from this path deleted before this batch began was deleted separately, earlier.
+        entry.items = items
+            .iter()
+            .filter(|item| item.time_deleted >= started)
+            .filter(|item| { let original = comparable_path(&item.original_path()); original == root || original.starts_with(&inside) })
+            .map(|item| TrashedItem { id: item.id.to_string_lossy().into_owned(), original: item.original_path().to_string_lossy().into_owned() })
+            .collect();
+    }
+}
+
+// Windows paths ignore case and accept either slash.
+#[cfg(not(target_os = "macos"))]
+fn comparable_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) { text.replace('/', "\\").trim_end_matches('\\').to_lowercase() } else { text.trim_end_matches('/').to_string() }
+}
+
+fn item_name(path: &str) -> String {
+    Path::new(path).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string())
+}
+
+// Puts deleted items back where they came from. Items whose old spot is taken, or that are no longer
+// in the trash, are left alone and reported; the rest are still restored.
+#[tauri::command]
+fn restore_entries(entries: Vec<TrashedEntry>) -> Result<(), String> {
+    let mut problems = Vec::new();
+    for entry in entries {
+        let name = item_name(&entry.path);
+        if Path::new(&entry.path).exists() {
+            problems.push(format!("{name}: an item with that name is already there."));
+        } else if entry.items.is_empty() {
+            problems.push(format!("{name}: it's no longer in the {TRASH_NAME}."));
+        } else if let Err(error) = restore_from_trash(entry.items) {
+            problems.push(format!("{name}: {error}"));
+        }
+    }
+    if problems.is_empty() { Ok(()) } else { Err(problems.join("\n")) }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn restore_from_trash(items: Vec<TrashedItem>) -> Result<(), String> {
+    let ids: std::collections::HashSet<String> = items.into_iter().map(|item| item.id).collect();
+    let found: Vec<_> = trash::os_limited::list().map_err(readable_trash_error)?.into_iter().filter(|item| ids.contains(item.id.to_string_lossy().as_ref())).collect();
+    if found.is_empty() { return Err(format!("it's no longer in the {TRASH_NAME}.")); }
+    trash::os_limited::restore_all(found).map_err(readable_trash_error)
+}
+
+// Here an item's id is where it sits on disk, so it just moves back, folders before what was in
+// them. Windows also keeps a $I file beside each $R item recording where it came from; that goes
+// too, or the Recycle Bin would go on listing the item.
+#[cfg(any(windows, target_os = "macos"))]
+fn restore_from_trash(mut items: Vec<TrashedItem>) -> Result<(), String> {
+    items.sort_by_key(|item| Path::new(&item.original).components().count());
+    let mut missing = false;
+    for item in &items {
+        let stored = Path::new(&item.id);
+        let original = Path::new(&item.original);
+        if !stored.exists() { missing = true; continue; }
+        if let Some(parent) = original.parent() { fs::create_dir_all(parent).map_err(|error| error.to_string())?; }
+        fs::rename(stored, original).map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        if let Some(suffix) = stored.file_name().and_then(|name| name.to_str()).and_then(|name| name.strip_prefix("$R")) {
+            let _ = fs::remove_file(stored.with_file_name(format!("$I{suffix}")));
+        }
+    }
+    if missing { Err(format!("some of it is no longer in the {TRASH_NAME}.")) } else { Ok(()) }
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
@@ -1257,6 +1403,42 @@ mod paste_entries_tests {
     }
 
     #[test]
+    fn deleted_entries_can_be_restored() {
+        let sandbox = Sandbox::new("delete-restore");
+        fs::write(sandbox.path("note.txt"), b"keep me").unwrap();
+        fs::create_dir_all(sandbox.path("pix")).unwrap();
+        fs::write(sandbox.path("pix").join("photo.jpg"), b"x").unwrap();
+        fs::create_dir_all(sandbox.path("pix").join("trip")).unwrap();
+        fs::write(sandbox.path("pix").join("trip").join("beach.jpg"), b"x").unwrap();
+        let paths = ["note.txt", "pix"].map(|name| sandbox.path(name).to_string_lossy().to_string()).to_vec();
+        let outcome = delete_entries(paths);
+        assert!(outcome.failures.is_empty());
+        assert!(!sandbox.path("note.txt").exists() && !sandbox.path("pix").exists());
+        assert!(outcome.trashed.iter().all(|entry| !entry.items.is_empty()));
+        let stored: Vec<_> = outcome.trashed.iter().flat_map(|entry| entry.items.iter().map(|item| PathBuf::from(&item.id))).collect();
+        restore_entries(outcome.trashed).unwrap();
+        assert!(stored.iter().all(|path| !path.exists()));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!trash::os_limited::list().unwrap().iter().any(|item| item.original_parent.starts_with(&sandbox.dir)));
+        assert_eq!(fs::read_to_string(sandbox.path("note.txt")).unwrap(), "keep me");
+        assert!(sandbox.path("pix").join("photo.jpg").exists());
+        assert!(sandbox.path("pix").join("trip").join("beach.jpg").exists());
+    }
+
+    #[test]
+    fn restore_skips_items_whose_name_is_taken() {
+        let sandbox = Sandbox::new("restore-taken");
+        fs::write(sandbox.path("a.txt"), b"old").unwrap();
+        fs::write(sandbox.path("b.txt"), b"b").unwrap();
+        let outcome = delete_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string(), sandbox.path("b.txt").to_string_lossy().to_string()]);
+        fs::write(sandbox.path("a.txt"), b"new").unwrap();
+        let error = restore_entries(outcome.trashed).unwrap_err();
+        assert!(error.contains("a.txt") && error.contains("already there"), "{error}");
+        assert_eq!(fs::read_to_string(sandbox.path("a.txt")).unwrap(), "new");
+        assert!(sandbox.path("b.txt").exists());
+    }
+
+    #[test]
     fn rename_entry_refuses_to_overwrite_existing_file() {
         let sandbox = Sandbox::new("rename-existing");
         fs::write(sandbox.path("a.txt"), b"source").unwrap();
@@ -2075,7 +2257,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }

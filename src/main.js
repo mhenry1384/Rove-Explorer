@@ -3,7 +3,8 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { homeDir, sep, resolveResource } from '@tauri-apps/api/path';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
-import { openPath } from '@tauri-apps/plugin-opener';
+import { openPath, openUrl } from '@tauri-apps/plugin-opener';
+import { LogicalPosition } from '@tauri-apps/api/dpi';
 import { ask, message } from '@tauri-apps/plugin-dialog';
 import { Menu, MenuItem, IconMenuItem, Submenu, PredefinedMenuItem } from '@tauri-apps/api/menu';
 import { startDrag } from '@crabnebula/tauri-plugin-drag';
@@ -15,6 +16,7 @@ const isWindows = SEP === '\\';
 const isMac = !isWindows && /Mac/.test(navigator.platform || navigator.userAgent);
 const CURRENT_PLATFORM = isWindows ? 'windows' : isMac ? 'macos' : 'linux';
 const COMPUTER_LABEL = isWindows ? 'This PC' : 'This Mac';
+const TRASH_NAME = isWindows ? 'Recycle Bin' : 'Trash';
 const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], drives: [], clipboard: null };
 const stored = JSON.parse(localStorage.getItem('rove-explorer-state') || '{}');
 const session = JSON.parse(localStorage.getItem('rove-explorer-session') || '{}');
@@ -217,7 +219,7 @@ function render() {
   // WebView2 fires blur on a focused input as it is removed; mark the old box so its blur handler
   // doesn't treat being replaced as the user finishing (or abandoning) the rename.
   if (oldRename) oldRename.dataset.replaced = 'true';
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span>${SHORTCUT_HINTS}</span></footer>`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label><button class="help-button" data-help-menu title="Help" aria-label="Help">HELP</button></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main>`;
   const newRename = renameSnapshot && document.querySelector('[data-rename]');
   if (newRename) { newRename.value = renameSnapshot.value; if (renameSnapshot.focused) { newRename.focus(); newRename.setSelectionRange(renameSnapshot.start, renameSnapshot.end); } }
   bindEvents();
@@ -323,9 +325,59 @@ function scheduleFolderReload(changedPath) {
   }, 200));
 }
 
-const SHORTCUT_HINTS = isMac
-  ? '<kbd>Return</kbd> open <kbd>⌫</kbd> up a level <kbd>F2</kbd> rename <kbd>⌘</kbd>+<kbd>⌫</kbd> move to Trash <kbd>⌘</kbd>+<kbd>[</kbd> back <kbd>⌘</kbd>+<kbd>]</kbd> forward'
-  : '<kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>F2</kbd> rename <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward';
+function keys(...names) { return names.map((name) => `<kbd>${name}</kbd>`).join('+'); }
+const SHORTCUTS = [
+  ['Navigate', isMac ? [
+    [`${keys('Return')} or ${keys('⌘', '↓')}`, 'Open the selected item'],
+    [`${keys('⌫')} or ${keys('⌘', '↑')}`, 'Go up a level'],
+    [`${keys('⌘', '[')} ${keys('⌘', ']')}`, 'Back / forward'],
+  ] : [
+    [keys('Enter'), 'Open the selected item'],
+    [keys('Backspace'), 'Go up a level'],
+    [`${keys('Alt', '←')} ${keys('Alt', '→')}`, 'Back / forward'],
+  ]],
+  ['Select', [
+    [`${keys('↑')} ${keys('↓')}`, 'Move the selection (in Thumbnails also ← →)'],
+    [`${keys('Home')} ${keys('End')}`, 'First / last item'],
+    [`${keys('Shift')} + arrow, ${keys('Home')} or ${keys('End')}`, 'Extend the selection'],
+    [`${keys(isMac ? '⌘' : 'Ctrl')}+click`, 'Add or remove one item'],
+    [`${keys('Shift')}+click`, 'Select a range'],
+    ['Type a name', 'Jump to the item starting with it'],
+  ]],
+  ['Edit', [
+    [keys('F2'), 'Rename'],
+    [isMac ? keys('⌘', '⌫') : keys('Delete'), `Move to the ${TRASH_NAME}`],
+    [keys(isMac ? '⌘' : 'Ctrl', 'Z'), 'Undo the last delete'],
+    [`${keys(isMac ? '⌘' : 'Ctrl', 'C')} ${keys(isMac ? '⌘' : 'Ctrl', 'X')} ${keys(isMac ? '⌘' : 'Ctrl', 'V')}`, 'Copy / cut / paste'],
+  ]],
+  ['Tabs', [['Middle-click a tab', 'Close it']]],
+  ['Help', [[keys('F1'), 'Show this list']]],
+];
+const APP_DESCRIPTION = 'A focused two-pane file explorer: side-by-side panes with tabs, favorite folders, thumbnails, a folder-size tree view, and copy, cut and paste that work with Explorer and Finder.';
+
+// Dialogs live outside #app so re-renders (e.g. a folder refreshing behind one) leave them alone.
+const dialogRoot = document.body.appendChild(document.createElement('div'));
+function isDialogOpen() { return !!dialogRoot.firstChild; }
+function closeDialog() { dialogRoot.innerHTML = ''; }
+function showDialog(title, body) {
+  dialogRoot.innerHTML = `<div class="dialog-backdrop" data-dialog-backdrop><section class="dialog" role="dialog" aria-modal="true" aria-label="${escapeAttribute(title)}"><header class="dialog-head"><h2>${escapeAttribute(title)}</h2><button class="dialog-close" data-dialog-close title="Close" aria-label="Close">×</button></header><div class="dialog-body">${body}</div></section></div>`;
+  dialogRoot.querySelector('[data-dialog-backdrop]').addEventListener('click', (event) => { if (event.target === event.currentTarget) closeDialog(); });
+  dialogRoot.querySelector('[data-dialog-close]').addEventListener('click', closeDialog);
+  dialogRoot.querySelectorAll('[data-external-link]').forEach((link) => link.addEventListener('click', (event) => { event.preventDefault(); openUrl(link.dataset.externalLink).catch((error) => console.error('openUrl failed', error)); }));
+  dialogRoot.querySelector('[data-dialog-close]').focus();
+}
+function showShortcuts() {
+  showDialog('Keyboard Shortcuts', SHORTCUTS.map(([section, rows]) => `<h3>${section}</h3><dl class="shortcut-list">${rows.map(([combo, action]) => `<dt>${combo}</dt><dd>${action}</dd>`).join('')}</dl>`).join(''));
+}
+function showAbout() {
+  const github = 'https://github.com/mhenry1384';
+  showDialog('About Rove Explorer', `<div class="about-head"><span class="brand-mark">R</span><div><strong>Rove Explorer</strong><span class="version-tag">v${APP_VERSION}</span></div></div><p>${APP_DESCRIPTION}</p><p><a href="${github}" data-external-link="${github}">${github}</a></p><p>Licensed under the GNU General Public License v3 (GPLv3).</p>`);
+}
+async function showHelpMenu(button) {
+  const rect = button.getBoundingClientRect();
+  const items = await Promise.all([MenuItem.new({ text: 'Keyboard Shortcuts', accelerator: 'F1', action: showShortcuts }), MenuItem.new({ text: 'About Rove Explorer', action: showAbout })]);
+  await (await Menu.new({ items })).popup(new LogicalPosition(rect.left, rect.bottom));
+}
 // Characters the OS won't accept in a file name (macOS reserves ':' because Finder displays it as '/').
 const INVALID_NAME_CHARS = isWindows ? /[\\/:*?"<>|]/ : isMac ? /[/:]/ : /\//;
 function textEditorLabel() { return platformName === 'macos' ? 'Edit in TextEdit' : 'Edit in Notepad'; }
@@ -470,8 +522,10 @@ function renderPane(pane, index) {
     : view === 'thumbnails'
       ? `<div class="table-wrap thumb-wrap" ${scrollAttrs}>${renderThumbnails(entries, selected, focusId, index)}</div>`
       : `<div class="table-wrap details-wrap" ${scrollAttrs}><div class="table-head ${isDriveRoot ? 'drive-head' : ''}">${headers}</div><div class="rows">${rows}</div></div>`;
+  const undoAction = state.activePane === index && undoStack[undoStack.length - 1];
+  const undoLink = undoAction ? `<button class="undo-link" data-undo-delete title="${escapeAttribute(undoDescription(undoAction))}">UNDO DELETE${undoStack.length > 1 ? ` (${undoStack.length})` : ''}</button>` : '';
   const viewSelect = tab?.path ? `<div class="view-switch" role="group" aria-label="Pane view"><span class="view-label">${VIEW_MODES.find((mode) => mode.id === view)?.label ?? ''}</span>${VIEW_MODES.map((mode) => `<button class="view-button ${mode.id === view ? 'active' : ''}" data-view-mode="${mode.id}" title="${mode.label}" aria-label="${mode.label}" aria-pressed="${mode.id === view}"><svg viewBox="0 0 16 16" aria-hidden="true">${mode.icon}</svg></button>`).join('')}</div>` : '';
-  return `<article class="pane ${state.activePane === index ? 'is-active' : ''}" data-pane="${index}"><div class="tabs">${pane.tabs.map((item, tabIndex) => `<button class="tab ${tabIndex === pane.activeTab ? 'active' : ''}" data-tab="${tabIndex}"><span class="tab-dot"></span>${item.label}${pane.tabs.length > 1 ? '<span class="tab-close" data-tab-close title="Close tab">×</span>' : ''}</button>`).join('')}<button class="new-tab" data-new-tab title="New tab">＋</button></div><div class="pathbar"><button class="nav-button" data-up title="Go up one level" aria-label="Go up one level">↑</button><div class="path-text">${breadcrumb}</div></div>${body}<div class="pane-footer"><span class="selection-label"><span class="item-count">${entries.length} ${entries.length === 1 ? 'ITEM' : 'ITEMS'}</span> · ${selected.length ? `${selected.length} SELECTED` : 'NOTHING SELECTED'}</span>${viewSelect}</div></article>`;
+  return `<article class="pane ${state.activePane === index ? 'is-active' : ''}" data-pane="${index}"><div class="tabs">${pane.tabs.map((item, tabIndex) => `<button class="tab ${tabIndex === pane.activeTab ? 'active' : ''}" data-tab="${tabIndex}"><span class="tab-dot"></span>${item.label}${pane.tabs.length > 1 ? '<span class="tab-close" data-tab-close title="Close tab">×</span>' : ''}</button>`).join('')}<button class="new-tab" data-new-tab title="New tab">＋</button></div><div class="pathbar"><button class="nav-button" data-up title="Go up one level" aria-label="Go up one level">↑</button><div class="path-text">${breadcrumb}</div></div>${body}<div class="pane-footer"><div class="pane-status"><span class="selection-label"><span class="item-count">${entries.length} ${entries.length === 1 ? 'ITEM' : 'ITEMS'}</span> · ${selected.length ? `${selected.length} SELECTED` : 'NOTHING SELECTED'}</span>${undoLink}</div>${viewSelect}</div></article>`;
 }
 
 const HISTORY_LIMIT = 25;
@@ -568,22 +622,69 @@ async function finishRename(index, entry, value) {
   saveSession(); scrollSelectionIntoView = true; render();
 }
 
+// Deletes that Undo can still bring back, newest last. Kept only while the app is running.
+const UNDO_LIMIT = 5;
+const undoStack = [];
+let undoBusy = false;
+function itemName(path) { return path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path; }
+
+// `trashed` is what delete_entries reports; items it couldn't find in the trash can't be undone.
+function rememberDelete(folder, trashed) {
+  const entries = trashed.filter((entry) => entry.items.length);
+  if (!folder || !entries.length) return;
+  undoStack.push({ folder, entries });
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+}
+
+function undoDescription(action) {
+  const names = action.entries.map((entry) => `"${itemName(entry.path)}"`);
+  const what = names.length === 1 ? names[0] : `${names.length} items: ${names.slice(0, 5).join(', ')}${names.length > 5 ? ', …' : ''}`;
+  const earlier = undoStack.length - 1;
+  return `Restore ${what} from the ${TRASH_NAME} to ${action.folder}${earlier ? `\n(${earlier} earlier delete${earlier === 1 ? '' : 's'} can also be undone)` : ''}`;
+}
+
+async function undoDelete() {
+  const action = undoStack[undoStack.length - 1];
+  if (!action || undoBusy) return;
+  undoBusy = true;
+  undoStack.pop();
+  let error = null;
+  try { await invoke('restore_entries', { entries: action.entries }); } catch (caught) { error = caught; }
+  undoBusy = false;
+  await showRestored(state.activePane, action).catch(() => render());
+  if (error) await message(`Couldn't restore everything.\n\n${error}`, { title: 'Undo failed', kind: 'error' });
+}
+
+// Opens the folder the items went back to and selects them.
+async function showRestored(index, action) {
+  const tab = currentTab(state.panes[index]);
+  if (!tab) return;
+  if (tab.view === 'tree') {
+    if (tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
+    tab.view = 'details'; tab.treeState = null;
+  }
+  await navigateTabTo(index, action.folder);
+  const restored = new Set(action.entries.map((entry) => normalizePath(entry.path)));
+  const ids = tab.entries.filter((entry) => restored.has(normalizePath(entry.path))).map((entry) => entry.id);
+  if (!ids.length) return;
+  tab.selected = ids; tab.focusId = ids[ids.length - 1]; tab.anchorId = ids[0];
+  saveSession(); scrollSelectionIntoView = true; render();
+}
+
 async function deleteEntries(index, entries) {
   const targets = entries.filter((entry) => entry && entry.kind !== 'drive');
   if (!targets.length) return;
   const pane = state.panes[index]; const tab = currentTab(pane);
-  const failures = [];
-  for (const entry of targets) {
-    try { await invoke('delete_entry', { path: entry.path }); } catch (error) { failures.push({ name: entry.name, error }); }
-  }
-  const failedIds = new Set(targets.filter((entry) => failures.some((failure) => failure.name === entry.name)).map((entry) => entry.id));
-  const deletedIds = new Set(targets.map((entry) => entry.id).filter((id) => !failedIds.has(id)));
+  const { trashed, failures } = await invoke('delete_entries', { paths: targets.map((entry) => entry.path) });
+  rememberDelete(tab.path, trashed);
+  const failedPaths = new Set(failures.map((failure) => failure.path));
+  const deletedIds = new Set(targets.filter((entry) => !failedPaths.has(entry.path)).map((entry) => entry.id));
   tab.entries = await load(tab.path);
   tab.selected = (tab.selected || []).filter((id) => !deletedIds.has(id));
   if (deletedIds.has(tab.focusId)) tab.focusId = null;
   if (deletedIds.has(tab.anchorId)) tab.anchorId = tab.focusId;
   saveSession(); render();
-  if (failures.length) await showDeleteFailures(failures);
+  if (failures.length) await showDeleteFailures(failures.map(({ path, error }) => ({ name: itemName(path), error })));
 }
 
 async function showDeleteFailures(failures) {
@@ -855,7 +956,9 @@ function removeTreeNode(node, targetPath) {
 async function deleteTreeNode(index, path) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.treeState?.tree || path === tab.treeState.tree.path) return;
-  try { await invoke('delete_entry', { path }); } catch (error) { render(); await showDeleteFailures([{ name: path.split(/[\\/]/).pop(), error }]); return; }
+  const { trashed, failures } = await invoke('delete_entries', { paths: [path] });
+  if (failures.length) { render(); await showDeleteFailures([{ name: itemName(path), error: failures[0].error }]); return; }
+  rememberDelete(parentPath(path), trashed);
   removeTreeNode(tab.treeState.tree, path);
   if (tab.treeState.selected === path) tab.treeState.selected = null;
   render();
@@ -871,18 +974,20 @@ async function enter(paneIndex, entry) {
   if (entry.kind === 'drive' || entry.kind === 'folder') { await navigateTabTo(paneIndex, entry.path); } else { try { await openPath(entry.path); } catch (error) { console.error('openPath failed', entry.path, error); } }
 }
 
+// The folder above `path`; '' (the drive list) above a drive root.
+function parentPath(path) {
+  const trimmed = path.replace(/[\\/]+$/, '');
+  if (!isWindows && path.startsWith('/')) {
+    if (trimmed === '') return '';
+    const lastSlash = trimmed.lastIndexOf('/'); return lastSlash <= 0 ? '/' : trimmed.slice(0, lastSlash);
+  }
+  const parent = /^[A-Za-z]:$/.test(trimmed) || trimmed === '' ? '' : trimmed.replace(/[\\/][^\\/]+$/, '') || '';
+  return /^[A-Za-z]:$/.test(parent) ? `${parent}\\` : parent;
+}
+
 async function goUp(index) {
   const tab = currentTab(state.panes[index]); if (!tab || !tab.path) return;
-  const trimmed = tab.path.replace(/[\\/]+$/, '');
-  let parent;
-  if (!isWindows && tab.path.startsWith('/')) {
-    if (trimmed === '') { parent = ''; }
-    else { const lastSlash = trimmed.lastIndexOf('/'); parent = lastSlash <= 0 ? '/' : trimmed.slice(0, lastSlash); }
-  } else {
-    parent = /^[A-Za-z]:$/.test(trimmed) || trimmed === '' ? '' : trimmed.replace(/[\\/][^\\/]+$/, '') || '';
-    if (/^[A-Za-z]:$/.test(parent)) parent += '\\';
-  }
-  await navigateTabTo(index, parent);
+  await navigateTabTo(index, parentPath(tab.path));
 }
 
 function moveSelection(index, direction, extend) {
@@ -1101,6 +1206,7 @@ function bindEvents() {
     });
     element.querySelector('[data-new-tab]').addEventListener('click', async (event) => { event.stopPropagation(); const current = currentTab(pane); const path = current?.path || ''; const entries = path ? await load(path) : await loadDrives(); const selected = rememberedOrFirst(entries, path ? stored[path]?.name : null); const focusId = selected[0] || null; pane.tabs.push(path ? { path, kind: 'folder', label: path.split(/[\\/]/).pop(), entries, selected, focusId, anchorId: focusId, history: [path], historyIndex: 0 } : { path: '', kind: 'drives', label: COMPUTER_LABEL, entries, selected, focusId, anchorId: focusId, history: [''], historyIndex: 0 }); pane.activeTab = pane.tabs.length - 1; saveSession(); render(); });
     element.querySelector('[data-up]').addEventListener('click', (event) => { event.stopPropagation(); goUp(index); });
+    element.querySelector('[data-undo-delete]')?.addEventListener('click', (event) => { event.stopPropagation(); undoDelete(); });
     element.querySelectorAll('[data-breadcrumb]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); navigateToPath(index, button.dataset.breadcrumb); }));
     element.querySelectorAll('[data-view-mode]').forEach((button) => button.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -1139,6 +1245,7 @@ function bindEvents() {
   document.querySelector('[data-go-back]')?.addEventListener('click', () => goBack(state.activePane));
   document.querySelector('[data-go-forward]')?.addEventListener('click', () => goForward(state.activePane));
   document.querySelector('[data-move-to-other-pane]')?.addEventListener('click', () => moveSelectedToOtherPane().catch((error) => console.error('move to other pane failed', error)));
+  document.querySelector('[data-help-menu]').addEventListener('click', (event) => showHelpMenu(event.currentTarget));
   document.querySelector('#hidden-toggle').addEventListener('change', async (event) => { state.showHidden = event.currentTarget.checked; await Promise.all(state.panes.flatMap((pane) => pane.tabs.filter((tab) => tab.path).map(async (tab) => { tab.entries = await load(tab.path); }))); render(); });
   const locationInput = document.querySelector('#location-input');
   // Select everything on focus; the mouseup that follows a click-to-focus would otherwise drop the selection to a caret.
@@ -1151,9 +1258,13 @@ function bindEvents() {
 }
 
 document.addEventListener('keydown', (event) => {
+  // An open dialog takes the keyboard; Tab and Enter still work on its buttons and link.
+  if (isDialogOpen()) { if (event.key === 'Escape') { event.preventDefault(); closeDialog(); } return; }
+  if (event.key === 'F1') { event.preventDefault(); showShortcuts(); return; }
   const isTyping = event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA';
   const pane = state.panes[state.activePane]; const tab = currentTab(pane);
   const isClipboardCombo = (event.ctrlKey || event.metaKey) && !event.altKey;
+  if (!isTyping && isClipboardCombo && !event.shiftKey && event.key.toLowerCase() === 'z') { event.preventDefault(); undoDelete(); return; }
   if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'c') { event.preventDefault(); copySelected(state.activePane); return; }
   if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'x') { event.preventDefault(); cutSelected(state.activePane); return; }
   if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'v') { event.preventDefault(); pasteIntoPane(state.activePane); return; }
