@@ -8,7 +8,6 @@ import { LogicalPosition } from '@tauri-apps/api/dpi';
 import { ask, message } from '@tauri-apps/plugin-dialog';
 import { Menu, MenuItem, IconMenuItem, Submenu, PredefinedMenuItem } from '@tauri-apps/api/menu';
 import { startDrag } from '@crabnebula/tauri-plugin-drag';
-import configuredFolders from '../config/folders.json';
 import { version as APP_VERSION } from '../package.json';
 
 const SEP = sep();
@@ -123,11 +122,36 @@ function pathSegments(path) {
     return { label: part, path: acc };
   });
 }
-async function resolveFolderPath(path) {
-  if (!path.startsWith('~')) return path;
-  const rest = path.slice(1).split(/[\\/]+/).filter(Boolean);
-  const home = (await homeDir()).replace(/[\\/]+$/, '');
-  return [home, ...rest].join(SEP);
+function joinPath(base, rest) { return [base.replace(/[\\/]+$/, ''), ...rest.split(/[\\/]+/).filter(Boolean)].join(SEP); }
+async function resolveFolderPath(path) { return path.startsWith('~') ? joinPath(await homeDir(), path.slice(1)) : path; }
+// Each bookmark is { path, name?, icon? }; name defaults to the folder name and icon to a guess from it.
+// A path can start with a folder looked up on this computer, such as {pictures} or {onedrive}; one that
+// finds several folders (a OneDrive per account) becomes a bookmark for each. Bookmarks whose folder
+// doesn't exist on this computer are left out. The list is the per-user folders.json (Help > Edit Favorite
+// Folders); if that doesn't parse, the bundled default is used instead.
+async function configuredFolders() {
+  const { contents } = await invoke('read_folders_config');
+  try { return parseFoldersConfig(contents); } catch (error) {
+    console.error('folders.json is invalid, using the default', error);
+    return parseFoldersConfig(await invoke('default_folders_config'));
+  }
+}
+function parseFoldersConfig(contents) {
+  const folders = JSON.parse(contents);
+  if (!Array.isArray(folders)) throw new Error('The file must contain a JSON array of folders.');
+  const bad = folders.findIndex((folder) => typeof folder?.path !== 'string');
+  if (bad !== -1) throw new Error(`Folder ${bad + 1} needs a "path" string.`);
+  return folders;
+}
+async function loadBookmarks() {
+  const [known, folders] = await Promise.all([invoke('known_folders'), configuredFolders()]);
+  const bookmarks = (await Promise.all(folders.map(async ({ path, name, icon }) => {
+    const [, key, rest] = path.match(/^\{(\w+)\}(.*)$/) || [];
+    const paths = key ? (known[key] || []).map((base) => joinPath(base, rest)) : [await resolveFolderPath(path)];
+    return paths.map((resolved) => ({ path: resolved, label: name || folderLabel(resolved), icon: icon || (key && !rest ? key : folderIcon(resolved)) }));
+  }))).flat();
+  const exists = await invoke('existing_folders', { paths: bookmarks.map(({ path }) => path) });
+  return bookmarks.filter((_, index) => exists[index]);
 }
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -219,7 +243,7 @@ function render() {
   // WebView2 fires blur on a focused input as it is removed; mark the old box so its blur handler
   // doesn't treat being replaced as the user finishing (or abandoning) the rename.
   if (oldRename) oldRename.dataset.replaced = 'true';
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label><button class="help-button" data-help-menu title="Help" aria-label="Help">HELP</button></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main>`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label><button class="help-button" data-help-menu title="Help" aria-label="Help">Help</button></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main>`;
   const newRename = renameSnapshot && document.querySelector('[data-rename]');
   if (newRename) { newRename.value = renameSnapshot.value; if (renameSnapshot.focused) { newRename.focus(); newRename.setSelectionRange(renameSnapshot.start, renameSnapshot.end); } }
   bindEvents();
@@ -388,9 +412,29 @@ function showAbout() {
   const github = 'https://github.com/mhenry1384';
   showDialog('About Rove Explorer', `<div class="about-head"><span class="brand-mark">R</span><div><strong>Rove Explorer</strong><span class="version-tag">v${APP_VERSION}</span></div></div><p>${APP_DESCRIPTION}</p><p><a href="${github}" data-external-link="${github}">${github}</a></p><p>Licensed under the GNU General Public License v3 (GPLv3).</p>`);
 }
+async function showFoldersEditor() {
+  let config;
+  try { config = await invoke('read_folders_config'); } catch (error) { await message(String(error), { title: 'Edit Favorite Folders failed', kind: 'error' }); return; }
+  showDialog('Edit Favorite Folders', `<p class="folders-editor-path">${escapeAttribute(config.path)}</p><textarea class="folders-editor" data-folders-text spellcheck="false" aria-label="folders.json">${escapeAttribute(config.contents)}</textarea><p class="folders-editor-error" data-folders-error></p><div class="dialog-actions"><button data-folders-default>Restore Default</button><span></span><button data-dialog-cancel>Cancel</button><button class="primary" data-folders-save>Save</button></div>`);
+  const text = dialogRoot.querySelector('[data-folders-text]');
+  const errorLine = dialogRoot.querySelector('[data-folders-error]');
+  dialogRoot.querySelector('[data-dialog-cancel]').addEventListener('click', closeDialog);
+  // Restoring only fills in the editor; nothing changes on disk until Save.
+  dialogRoot.querySelector('[data-folders-default]').addEventListener('click', async () => { text.value = await invoke('default_folders_config'); errorLine.textContent = ''; text.focus(); });
+  const save = dialogRoot.querySelector('[data-folders-save]');
+  text.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); save.click(); } });
+  save.addEventListener('click', async () => {
+    try { parseFoldersConfig(text.value); } catch (error) { errorLine.textContent = `Not saved: ${error.message}`; text.focus(); return; }
+    try { await invoke('write_folders_config', { contents: text.value }); } catch (error) { errorLine.textContent = `Not saved: ${error}`; return; }
+    closeDialog();
+    state.folders = await loadBookmarks().catch((error) => { console.error('loadBookmarks failed', error); return state.folders; });
+    render();
+  });
+  text.focus();
+}
 async function showHelpMenu(button) {
   const rect = button.getBoundingClientRect();
-  const items = await Promise.all([MenuItem.new({ text: 'Keyboard Shortcuts', accelerator: 'F1', action: showShortcuts }), MenuItem.new({ text: 'About Rove Explorer', action: showAbout })]);
+  const items = await Promise.all([MenuItem.new({ text: 'Keyboard Shortcuts', accelerator: 'F1', action: showShortcuts }), MenuItem.new({ text: 'Edit Favorite Folders…', action: showFoldersEditor }), MenuItem.new({ text: 'About Rove Explorer', action: showAbout })]);
   await (await Menu.new({ items })).popup(new LogicalPosition(rect.left, rect.bottom));
 }
 // Characters the OS won't accept in a file name (macOS reserves ':' because Finder displays it as '/').
@@ -1117,7 +1161,7 @@ function findTabByTreeRequest(requestId) {
 
 function bindEvents() {
   document.querySelectorAll('[data-sort-key]').forEach((button) => button.addEventListener('click', () => setSort(button.dataset.sortKey)));
-  document.querySelectorAll('[data-folder-path]').forEach((button) => button.addEventListener('click', async () => { try { await navigatePath(await resolveFolderPath(button.dataset.folderPath)); } catch { button.classList.add('is-unavailable'); } }));
+  document.querySelectorAll('[data-folder-path]').forEach((button) => button.addEventListener('click', async () => { try { await navigatePath(button.dataset.folderPath); } catch { button.classList.add('is-unavailable'); } }));
   document.querySelectorAll('.pane').forEach((element) => { const index = Number(element.dataset.pane); const pane = state.panes[index]; element.addEventListener('click', () => { state.activePane = index; render(); });
     element.addEventListener('contextmenu', (event) => {
       if (event.target.closest('[data-entry]') || event.target.closest('[data-tree-node]')) return;
@@ -1346,8 +1390,7 @@ function drivesTab(drives, savedSelected) {
 }
 
 async function start() {
-  // Each bookmark is { path, name?, icon? }; name defaults to the folder name and icon to a guess from it.
-  state.folders = configuredFolders.filter(({ platform }) => !platform || platform === CURRENT_PLATFORM).map(({ path, name, icon }) => ({ path, label: name || folderLabel(path), icon: icon || folderIcon(path) }));
+  const bookmarks = loadBookmarks().catch((error) => { console.error('loadBookmarks failed', error); return []; });
   invoke('platform_name').then((name) => { platformName = name; }).catch(() => {});
   resolveResource('icons/32x32.png').then((path) => { dragIconPath = path; }).catch((error) => console.error('resolveResource failed', error));
   setupExternalDragDrop();
@@ -1365,6 +1408,7 @@ async function start() {
     })) : [drivesTab(drives)];
     state.panes[index] = { tabs, activeTab: Math.min(saved?.activeTab || 0, tabs.length - 1) };
   }
+  state.folders = await bookmarks;
   render();
 }
 

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Default)]
 struct WatcherState {
@@ -461,6 +461,139 @@ fn create_folder(dest_dir: String) -> Result<String, String> {
 #[tauri::command]
 fn platform_name() -> &'static str {
     std::env::consts::OS
+}
+
+// The first group of candidate folders that has any folder that exists, with duplicates removed
+// (the same folder can turn up twice, e.g. under the OneDrive and OneDriveConsumer variables).
+fn first_existing(groups: Vec<Vec<PathBuf>>) -> Vec<String> {
+    for group in groups {
+        let mut keys = Vec::new();
+        let mut found = Vec::new();
+        for path in group.into_iter().filter(|path| path.is_dir()) {
+            let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if keys.contains(&key) { continue; }
+            keys.push(key);
+            found.push(path.to_string_lossy().to_string());
+        }
+        if !found.is_empty() { return found; }
+    }
+    Vec::new()
+}
+
+// Folders that macOS cloud providers keep under ~/Library/CloudStorage, one per account,
+// named like OneDrive-Personal or GoogleDrive-someone@example.com.
+fn cloud_storage_folders(prefix: &str) -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else { return Vec::new() };
+    let mut folders: Vec<PathBuf> = fs::read_dir(home.join("Library").join("CloudStorage")).into_iter().flatten().filter_map(Result::ok)
+        .filter(|item| item.file_name().to_string_lossy().starts_with(prefix))
+        .map(|item| item.path())
+        .collect();
+    folders.sort();
+    folders
+}
+
+// The OneDrive client sets one variable per signed-in account on Windows; on macOS each account
+// is a File Provider folder. ~/OneDrive is only a last resort, for older clients.
+fn onedrive_folders() -> Vec<String> {
+    let mut accounts: Vec<PathBuf> = ["OneDriveConsumer", "OneDriveCommercial", "OneDrive"].iter().filter_map(std::env::var_os).map(PathBuf::from).collect();
+    accounts.extend(cloud_storage_folders("OneDrive-"));
+    first_existing(vec![accounts, dirs::home_dir().map(|home| home.join("OneDrive")).into_iter().collect()])
+}
+
+// My Drive folders that Google Drive for desktop mirrors to local disk, as recorded in its settings database.
+fn google_drive_mirrors() -> Vec<PathBuf> {
+    let Some(database) = dirs::data_local_dir().map(|dir| dir.join("Google").join("DriveFS").join("root_preference_sqlite.db")) else { return Vec::new() };
+    let Ok(connection) = rusqlite::Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return Vec::new() };
+    let Ok(mut statement) = connection.prepare("SELECT last_seen_absolute_path FROM roots WHERE is_my_drive = 1") else { return Vec::new() };
+    statement.query_map([], |row| row.get::<_, String>(0)).map(|rows| rows.filter_map(Result::ok).map(PathBuf::from).collect()).unwrap_or_default()
+}
+
+// Drive letters Google Drive for desktop streams files on, recognised by their volume label.
+#[cfg(windows)]
+fn google_drive_volumes() -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn GetVolumeInformationW(root: *const u16, name: *mut u16, name_len: u32, serial: *mut u32, max_component: *mut u32, flags: *mut u32, filesystem: *mut u16, filesystem_len: u32) -> i32;
+    }
+    drive_signature().into_iter().filter_map(|letter| {
+        let root = format!("{}:\\", letter);
+        let wide_root: Vec<u16> = std::ffi::OsStr::new(&root).encode_wide().chain(Some(0)).collect();
+        let mut label = [0u16; 256];
+        if unsafe { GetVolumeInformationW(wide_root.as_ptr(), label.as_mut_ptr(), label.len() as u32, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) } == 0 { return None; }
+        let label = String::from_utf16_lossy(&label[..label.iter().position(|value| *value == 0).unwrap_or(label.len())]);
+        (label == "Google Drive").then(|| PathBuf::from(root))
+    }).collect()
+}
+
+#[cfg(not(windows))]
+fn google_drive_volumes() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+// A mirrored My Drive wins over the streamed one, since that's the copy the user chose to keep locally;
+// ~/Google Drive is where the old Backup and Sync client put it.
+fn google_drive_folders() -> Vec<String> {
+    let streamed = cloud_storage_folders("GoogleDrive-").into_iter().chain(google_drive_volumes()).map(|root| root.join("My Drive")).collect();
+    first_existing(vec![google_drive_mirrors(), streamed, dirs::home_dir().map(|home| home.join("Google Drive")).into_iter().collect()])
+}
+
+// Where this computer keeps the standard user folders and any cloud drive folders, asking the OS
+// (known folders on Windows, XDG user dirs on Linux) rather than assuming they sit in the home folder.
+// Folders that don't exist are left out; the cloud drives can have one folder per account.
+#[tauri::command]
+fn known_folders() -> HashMap<&'static str, Vec<String>> {
+    let standard = [("desktop", dirs::desktop_dir()), ("documents", dirs::document_dir()), ("downloads", dirs::download_dir()), ("pictures", dirs::picture_dir()), ("music", dirs::audio_dir()), ("videos", dirs::video_dir())];
+    let mut folders: HashMap<&'static str, Vec<String>> = standard.into_iter().map(|(key, path)| (key, first_existing(vec![path.into_iter().collect()]))).collect();
+    folders.insert("onedrive", onedrive_folders());
+    folders.insert("gdrive", google_drive_folders());
+    folders
+}
+
+// The bookmark list lives in the per-user config folder (%APPDATA%\com.roveexplorer.app on Windows,
+// ~/Library/Application Support/com.roveexplorer.app on macOS) so reinstalling the app leaves it alone.
+// The copy bundled from config/folders.json is the default, written there the first time it's needed.
+const DEFAULT_FOLDERS_CONFIG: &str = include_str!("../../config/folders.json");
+
+fn folders_config_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app.path().app_config_dir().map_err(|error| error.to_string())?.join("folders.json"))
+}
+
+#[derive(Serialize)]
+struct FoldersConfig {
+    path: String,
+    contents: String,
+}
+
+#[tauri::command]
+fn read_folders_config(app: AppHandle) -> Result<FoldersConfig, String> {
+    let path = folders_config_path(&app)?;
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::write(&path, DEFAULT_FOLDERS_CONFIG).map_err(|error| error.to_string())?;
+    }
+    let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    Ok(FoldersConfig { path: path.to_string_lossy().into_owned(), contents })
+}
+
+#[tauri::command]
+fn write_folders_config(app: AppHandle, contents: String) -> Result<(), String> {
+    let path = folders_config_path(&app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(&path, contents).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn default_folders_config() -> &'static str {
+    DEFAULT_FOLDERS_CONFIG
+}
+
+#[tauri::command]
+fn existing_folders(paths: Vec<String>) -> Vec<bool> {
+    paths.iter().map(|path| Path::new(path).is_dir()).collect()
 }
 
 // Whether every path lives on the same volume as dest_dir, so a drop there moves rather than copies.
@@ -2257,7 +2390,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }

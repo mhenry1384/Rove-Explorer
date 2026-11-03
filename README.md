@@ -66,13 +66,13 @@ npm run preview  # Preview the built frontend
 
 ## Configuration
 
-Bookmarks shown in the folder toolbar are defined in [`config/folders.json`](config/folders.json) as `{ "path", "name", "icon" }` entries. Paths can use `~` to refer to the user's home directory. `icon` names an SVG in `public/folder-icons/` (without the extension); `name` and `icon` are optional and default to the folder name and a guess from it. An optional `"platform"` (`"windows"`, `"macos"` or `"linux"`) shows the bookmark only on that OS, for paths that exist on just one machine. The file is bundled at build time, so rebuild after editing it.
+Bookmarks shown in the folder toolbar are defined in [`config/folders.json`](config/folders.json) as `{ "path", "name", "icon" }` entries. A path can start with a folder the app looks up on the current computer: `{desktop}`, `{documents}`, `{downloads}`, `{pictures}`, `{music}`, `{videos}`, `{onedrive}` (every signed-in OneDrive account) or `{gdrive}` (Google Drive's My Drive folder, mirrored or streamed), e.g. `{downloads}/Phone Sync`. Paths can also use `~` for the user's home directory. Bookmarks whose folder doesn't exist on the computer are hidden, so the same file works on any machine. `icon` names an SVG in `public/folder-icons/` (without the extension); `name` and `icon` are optional and default to the folder name and an icon matching the `{folder}` or the folder name. Each user has their own copy, `folders.json` in the app's config folder (`%APPDATA%\com.roveexplorer.app` on Windows, `~/Library/Application Support/com.roveexplorer.app` on macOS), so reinstalling the app leaves it alone. It's created from `config/folders.json` the first time the app runs, and **Help > Edit Favorite Folders…** opens it in a small editor that can also restore that default.
 
 ## Project structure
 
 ```
 src/                  Frontend (JS/CSS)
 src-tauri/            Tauri app (Rust) — commands, window setup, icon extraction
-config/folders.json   Pinned folder list
+config/folders.json   Default pinned folder list (copied to the per-user config)
 public/               Static assets (folder icons, etc.)
 ```

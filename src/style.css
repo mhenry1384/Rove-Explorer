@@ -67,6 +67,16 @@ html, body, #app { height: 100%; overflow: hidden; }
 .dialog-body p { margin: 12px 0 0; }
 .dialog-body a { color: #2f6fed; font: 11px 'DM Mono'; }
 .dialog kbd { color: var(--ink); border: 1px solid #c5c8bc; padding: 2px 5px; margin: 0 1px; font: 10px 'DM Mono'; background: #fafaf6; }
+.dialog:has(.folders-editor) { width: min(760px, 100%); }
+.folders-editor-path { font: 10px 'DM Mono'; color: var(--muted); word-break: break-all; }
+.folders-editor { display: block; width: 100%; height: 340px; margin-top: 10px; resize: vertical; border: 1px solid var(--line); background: #fff; padding: 10px; font: 11px/1.6 'DM Mono'; color: var(--ink); outline: none; white-space: pre; tab-size: 2; }
+.folders-editor:focus { border-color: #a9b168; box-shadow: 0 0 0 3px #e8f0c8; }
+.folders-editor-error { min-height: 1.55em; margin-top: 8px !important; color: #b3261e; }
+.dialog-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.dialog-actions span { flex: 1; }
+.dialog-actions button { height: 30px; padding: 0 14px; border: 1px solid var(--line); background: transparent; font: 500 10px 'DM Mono'; letter-spacing: .04em; color: var(--ink); }
+.dialog-actions button:hover, .dialog-actions button:focus-visible { border-color: #a9b168; background: #f4f7df; outline: none; }
+.dialog-actions button.primary { border-color: #a9b168; background: var(--lime); }
 .shortcut-list { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; margin: 0; }
 .shortcut-list dt { font: 10px 'DM Mono'; color: var(--muted); white-space: nowrap; }
 .shortcut-list dd { margin: 0; }
