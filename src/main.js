@@ -313,16 +313,31 @@ function scheduleFolderReload(changedPath) {
     for (const pane of state.panes) {
       const tab = currentTab(pane);
       if (!tab?.path || normalizePath(tab.path) !== key) continue;
-      const selectedNames = new Set(tab.entries.filter((entry) => tab.selected?.includes(entry.id)).map((entry) => entry.name));
-      const focusName = tab.entries.find((entry) => entry.id === tab.focusId)?.name;
-      tab.entries = await load(tab.path);
-      tab.selected = tab.entries.filter((entry) => selectedNames.has(entry.name)).map((entry) => entry.id);
-      tab.focusId = focusName ? tab.entries.find((entry) => entry.name === focusName)?.id || null : null;
-      tab.anchorId = tab.focusId;
+      await reloadTabEntries(tab);
       changed = true;
     }
     if (changed) { saveSession(); render(); }
   }, 200));
+}
+
+// Re-reads a tab's folder, keeping the same items selected and focused by name.
+async function reloadTabEntries(tab) {
+  const selectedNames = new Set(tab.entries.filter((entry) => tab.selected?.includes(entry.id)).map((entry) => entry.name));
+  const focusName = tab.entries.find((entry) => entry.id === tab.focusId)?.name;
+  tab.entries = await load(tab.path);
+  tab.selected = tab.entries.filter((entry) => selectedNames.has(entry.name)).map((entry) => entry.id);
+  tab.focusId = focusName ? tab.entries.find((entry) => entry.name === focusName)?.id || null : null;
+  tab.anchorId = tab.focusId;
+}
+
+// Background tabs aren't watched, so a tab brought to the front catches up on anything that changed meanwhile.
+async function refreshActivatedTab(index) {
+  const tab = currentTab(state.panes[index]);
+  if (!tab?.path) return;
+  if (tab.view === 'tree' && tab.treeState) scheduleTreeRescan(index, tab.treeState);
+  try { await reloadTabEntries(tab); } catch { return; } // folder may be gone; keep what it showed
+  if (currentTab(state.panes[index]) !== tab) return;
+  saveSession(); render();
 }
 
 function keys(...names) { return names.map((name) => `<kbd>${name}</kbd>`).join('+'); }
@@ -1043,12 +1058,14 @@ function closeTab(index, tabIndex) {
   const tab = pane.tabs[tabIndex];
   if (!tab || pane.tabs.length <= 1) return;
   if (tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
-  if (state.editing?.pane === index && tabIndex === pane.activeTab) state.editing = null;
+  const closingActive = tabIndex === pane.activeTab;
+  if (state.editing?.pane === index && closingActive) state.editing = null;
   pane.tabs.splice(tabIndex, 1);
   if (tabIndex < pane.activeTab) pane.activeTab -= 1;
   else pane.activeTab = Math.min(pane.activeTab, pane.tabs.length - 1);
   state.activePane = index;
   saveSession(); render();
+  if (closingActive) refreshActivatedTab(index);
 }
 
 function cancelTreeView(index) {
@@ -1199,7 +1216,10 @@ function bindEvents() {
       button.addEventListener('click', (event) => {
         event.stopPropagation();
         if (event.target.closest('[data-tab-close]')) { closeTab(index, Number(button.dataset.tab)); return; }
-        state.activePane = index; pane.activeTab = Number(button.dataset.tab); saveSession(); render();
+        const tabIndex = Number(button.dataset.tab);
+        const switched = tabIndex !== pane.activeTab;
+        state.activePane = index; pane.activeTab = tabIndex; saveSession(); render();
+        if (switched) refreshActivatedTab(index);
       });
       // Middle-click closes a tab, as in browsers.
       button.addEventListener('auxclick', (event) => { if (event.button === 1) { event.preventDefault(); event.stopPropagation(); closeTab(index, Number(button.dataset.tab)); } });
