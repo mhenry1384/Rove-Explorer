@@ -4,6 +4,7 @@
 
 - Before every release build, check `git status`. If there are uncommitted changes, bump the
   version number first: increment the rightmost digit (e.g. 0.4.0 -> 0.4.1) in `package.json`,
+  `package-lock.json` (both the top-level `version` and the one under `packages[""]`),
   `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`. If the working tree is clean, keep the
   current version.
 - Do not generate an installer during a release build unless the user explicitly asks for one.
