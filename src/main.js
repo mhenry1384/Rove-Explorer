@@ -440,7 +440,7 @@ async function showHelpMenu(button) {
 // Characters the OS won't accept in a file name (macOS reserves ':' because Finder displays it as '/').
 const INVALID_NAME_CHARS = isWindows ? /[\\/:*?"<>|]/ : isMac ? /[/:]/ : /\//;
 function textEditorLabel() { return platformName === 'macos' ? 'Edit in TextEdit' : 'Edit in Notepad'; }
-const TEXT_EDITOR_EXTENSIONS = new Set(['.txt', '.md', '.lst']);
+const TEXT_EDITOR_EXTENSIONS = new Set(['.txt', '.md', '.lst', '.bat']);
 function canEditInTextEditor(pane) {
   const entries = selectedFileEntries(pane);
   return (platformName === 'windows' || platformName === 'macos') && entries.length > 0 && entries.every((entry) => entry.kind === 'file' && TEXT_EDITOR_EXTENSIONS.has(extension(entry.name).toLowerCase()));
@@ -491,6 +491,25 @@ function propertiesPaths(menu) {
   return selectedFileEntries(menu.pane).map((entry) => entry.path);
 }
 
+// Filled in at startup when LockHunter is installed ({ icon }), since a native menu can't wait on it.
+let lockHunter = null;
+
+// The one item LockHunter would inspect from this menu, and whether it's a folder.
+function lockHunterTarget(menu) {
+  if (menu.kind === 'tree') return { path: menu.path, folder: true };
+  if (menu.kind === 'pane') { const path = currentTab(state.panes[menu.pane])?.path; return path ? { path, folder: true } : null; }
+  const entries = selectedFileEntries(menu.pane);
+  return entries.length === 1 && entries[0].kind !== 'drive' ? { path: entries[0].path, folder: entries[0].kind === 'folder' } : null;
+}
+
+function lockHunterMenuItem(menu) {
+  const target = lockHunter && lockHunterTarget(menu);
+  if (!target) return null;
+  const text = `What is Locking this ${target.folder ? 'Folder' : 'File'}?`;
+  const action = () => invoke('open_in_lockhunter', { path: target.path }).catch((error) => message(String(error), { title: 'LockHunter failed', kind: 'error' }));
+  return lockHunter.icon ? IconMenuItem.new({ text, icon: dataUriBytes(lockHunter.icon), action }) : MenuItem.new({ text, action });
+}
+
 function showProperties(menu) {
   const paths = propertiesPaths(menu);
   if (paths.length) invoke('show_properties', { paths }).catch((error) => console.error('show_properties failed', error));
@@ -520,6 +539,8 @@ async function showContextMenu(menu) {
     }
     items.push(item('Delete', () => (kind === 'tree' ? deleteTreeNode(pane, menu.path) : deleteSelected(pane))));
   }
+  const lockHunterItem = lockHunterMenuItem(menu);
+  if (lockHunterItem) items.push(separator(), lockHunterItem);
   if ((platformName === 'windows' || platformName === 'macos') && propertiesPaths(menu).length) items.push(separator(), item(platformName === 'macos' ? 'Get Info' : 'Properties', () => showProperties(menu)));
   const nativeMenu = await Menu.new({ items: await Promise.all(items) });
   await nativeMenu.popup();
@@ -1392,6 +1413,7 @@ function drivesTab(drives, savedSelected) {
 async function start() {
   const bookmarks = loadBookmarks().catch((error) => { console.error('loadBookmarks failed', error); return []; });
   invoke('platform_name').then((name) => { platformName = name; }).catch(() => {});
+  invoke('lockhunter_info').then((info) => { lockHunter = info; }).catch(() => {});
   resolveResource('icons/32x32.png').then((path) => { dragIconPath = path; }).catch((error) => console.error('resolveResource failed', error));
   setupExternalDragDrop();
   const drives = await loadDrives();

@@ -13,6 +13,7 @@ A focused, dual-pane file explorer built with [Tauri](https://tauri.app) (Rust) 
 - File type icons from the OS shell (Windows Explorer / Finder) with graceful fallback
 - Copy/cut/paste shares the system clipboard with Explorer and Finder
 - Breadcrumb path navigation and hidden-file toggle
+- On Windows, if [LockHunter](https://lockhunter.com) is installed, the right-click menu gets a **What is Locking this Folder?** (or **…this File?**) item, with LockHunter's icon, that opens LockHunter on that item to show which programs are holding it open. The app looks for LockHunter where its installer recorded it, then in `Program Files\LockHunter`; if it isn't found, the item doesn't appear.
 
 ## Tech stack
 

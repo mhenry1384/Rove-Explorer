@@ -785,6 +785,41 @@ fn open_with_other_app(path: String) -> Result<(), String> {
     }
 }
 
+#[derive(Serialize)]
+struct LockHunterInfo {
+    icon: Option<String>,
+}
+
+// LockHunter (lockhunter.com) shows which processes hold a file or folder open. When it's installed,
+// the context menu offers it; None means it isn't.
+#[tauri::command]
+fn lockhunter_info() -> Option<LockHunterInfo> {
+    #[cfg(windows)]
+    {
+        let exe = win_shell::lockhunter_exe()?;
+        Some(LockHunterInfo { icon: win_shell::exe_icon(&exe.to_string_lossy()) })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[tauri::command]
+fn open_in_lockhunter(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let exe = win_shell::lockhunter_exe().ok_or("LockHunter is not installed")?;
+        std::process::Command::new(exe).arg(&path).spawn().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("LockHunter is only available on Windows".to_string())
+    }
+}
+
 // Lists the apps registered for the file's extension, with their icons.
 #[cfg(target_os = "macos")]
 mod mac_open_with {
@@ -1005,14 +1040,58 @@ mod win_shell {
         if get(handler, &mut location, &mut index) < 0 || location.is_null() {
             return None;
         }
-        let location = take_co_string(location);
+        icon_data_uri(&take_co_string(location), index)
+    }
+
+    // The small icon at `index` in an exe or dll, as a PNG data URI.
+    fn icon_data_uri(location: &str, index: i32) -> Option<String> {
         let mut icon = 0;
-        if ExtractIconExW(wide(&location).as_ptr(), index, std::ptr::null_mut(), &mut icon, 1) == 0 || icon == 0 {
+        unsafe {
+            if ExtractIconExW(wide(location).as_ptr(), index, std::ptr::null_mut(), &mut icon, 1) == 0 || icon == 0 {
+                return None;
+            }
+            let png = super::icon_rgba(icon).and_then(|(width, height, rgba)| super::rgba_png(width, height, rgba));
+            DestroyIcon(icon);
+            png.map(|bytes| format!("data:image/png;base64,{}", super::base64_encode(&bytes)))
+        }
+    }
+
+    pub fn exe_icon(path: &str) -> Option<String> {
+        icon_data_uri(path, 0)
+    }
+
+    // Where LockHunter's installer recorded it, falling back to its default install folders.
+    pub fn lockhunter_exe() -> Option<std::path::PathBuf> {
+        let mut folders: Vec<std::path::PathBuf> = Vec::new();
+        for key in [
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\LockHunter_is1",
+            r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\LockHunter_is1",
+            r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\LockHunter_is1",
+        ] {
+            if let Some(location) = registry_string(key, "InstallLocation") {
+                folders.push(location.into());
+            }
+        }
+        for variable in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+            if let Some(dir) = std::env::var_os(variable) {
+                folders.push(std::path::PathBuf::from(dir).join("LockHunter"));
+            }
+        }
+        folders.into_iter().map(|folder| folder.join("LockHunter.exe")).find(|exe| exe.is_file())
+    }
+
+    fn registry_string(key: &str, value: &str) -> Option<String> {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = std::process::Command::new("reg").args(["query", key, "/v", value]).creation_flags(CREATE_NO_WINDOW).output().ok()?;
+        if !output.status.success() {
             return None;
         }
-        let png = super::icon_rgba(icon).and_then(|(width, height, rgba)| super::rgba_png(width, height, rgba));
-        DestroyIcon(icon);
-        png.map(|bytes| format!("data:image/png;base64,{}", super::base64_encode(&bytes)))
+        // A matching line reads "    InstallLocation    REG_SZ    C:\Program Files\LockHunter\".
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(value)?.trim_start().strip_prefix("REG_SZ").map(|rest| rest.trim().to_string()))
+            .filter(|location| !location.is_empty())
     }
 
     // Walks the recommended IAssocHandlers for the file's extension, stopping once `visit` returns false.
@@ -2390,7 +2469,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, show_properties, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }
