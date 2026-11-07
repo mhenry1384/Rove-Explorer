@@ -265,7 +265,7 @@ function render() {
     if (folderPath) scrollable.addEventListener('scroll', () => rememberScroll(folderPath, scrollable.dataset.scrollView, scrollable.scrollTop), { passive: true });
   });
   if (scrollSelectionIntoView) {
-    const selectedRow = document.querySelector(`.pane[data-pane="${state.activePane}"] .file-row.focused, .pane[data-pane="${state.activePane}"] .thumb-card.focused`);
+    const selectedRow = document.querySelector(`.pane[data-pane="${state.activePane}"] .file-row.focused, .pane[data-pane="${state.activePane}"] .thumb-card.focused, .pane[data-pane="${state.activePane}"] .tree-row.selected`);
     selectedRow?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     scrollSelectionIntoView = false;
   }
@@ -1175,6 +1175,38 @@ function toggleTreeNode(index, path) {
   render();
 }
 
+// The rows currently on screen, top to bottom: the root plus the children of every expanded node.
+function visibleTreeNodes(node, expanded, parent = null, out = []) {
+  out.push({ node, parent });
+  if (expanded.has(node.path)) node.children.forEach((child) => visibleTreeNodes(child, expanded, node, out));
+  return out;
+}
+
+// Up/Down/Home/End move through the visible rows. Right expands a collapsed node (or steps into an
+// expanded one); Left collapses an expanded node (or steps out to its parent), as in Explorer's tree.
+function handleTreeKey(index, key) {
+  const treeState = currentTab(state.panes[index])?.treeState;
+  if (treeState?.status !== 'done' || !treeState.tree) return;
+  const rows = visibleTreeNodes(treeState.tree, treeState.expanded);
+  const current = rows.findIndex((row) => row.node.path === treeState.selected);
+  const { node, parent } = rows[current] || {};
+  let target = null;
+  if (key === 'Home') target = rows[0].node;
+  else if (key === 'End') target = rows[rows.length - 1].node;
+  else if (current < 0) target = key === 'ArrowUp' ? rows[rows.length - 1].node : rows[0].node;
+  else if (key === 'ArrowUp') target = rows[Math.max(0, current - 1)].node;
+  else if (key === 'ArrowDown') target = rows[Math.min(rows.length - 1, current + 1)].node;
+  else if (key === 'ArrowRight' && node.children.length) {
+    if (treeState.expanded.has(node.path)) target = node.children[0];
+    else treeState.expanded.add(node.path);
+  } else if (key === 'ArrowLeft') {
+    if (node.children.length && treeState.expanded.has(node.path)) treeState.expanded.delete(node.path);
+    else if (parent) target = parent;
+  }
+  if (target) treeState.selected = target.path;
+  scrollSelectionIntoView = true; render();
+}
+
 function findTabByTreeRequest(requestId) {
   for (const pane of state.panes) for (const tab of pane.tabs) if (tab.treeState?.requestId === requestId) return tab;
   return null;
@@ -1376,6 +1408,7 @@ document.addEventListener('keydown', (event) => {
     if (step) moveSelection(state.activePane, step, event.shiftKey);
     return;
   }
+  if (tab?.view === 'tree' && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { event.preventDefault(); handleTreeKey(state.activePane, event.key); return; }
   if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveSelection(state.activePane, event.key === 'ArrowUp' ? -1 : 1, event.shiftKey); return; }
   if ((event.key === 'Home' || event.key === 'End') && tab?.view !== 'tree') { event.preventDefault(); moveSelection(state.activePane, event.key === 'Home' ? -Infinity : Infinity, event.shiftKey); return; }
   if (event.key === 'Enter' && tab?.view === 'tree') { event.preventDefault(); if (tab.treeState?.selected) openTreeNode(state.activePane, tab.treeState.selected); return; }
