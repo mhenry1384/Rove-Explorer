@@ -9,7 +9,9 @@ A focused, dual-pane file explorer built with [Tauri](https://tauri.app) (Rust) 
 - Drive listing (Windows drives / mounted volumes)
 - Live directory watching — panes refresh automatically when the filesystem changes
 - Rename, delete (to trash, with up to five levels of undo), and open files/folders
-- Folder size / item-count statistics computed recursively, with cancellation support
+- Folder size / item-count statistics computed recursively (Tree View), with cancellation support
+- Search view: lists every file under the current folder once, then shows the files whose name contains the text typed in the search box. Text with a `*` is a wildcard pattern for the whole name, so `P*.mov` finds names that start with P and end with .mov. Matching ignores case. It shows the total number of matches, and up to 100 of them). Right-click a result for the usual file commands plus **Open File Location**, which opens its folder in Details view with the file selected.
+- Tree View and Search view refuse folders containing more than 200,000 files and say there are too many files; this is a somewhat arbitrary limit we picked to keep scans and memory use reasonable.
 - File type icons from the OS shell (Windows Explorer / Finder) with graceful fallback
 - Copy/cut/paste shares the system clipboard with Explorer and Finder
 - Breadcrumb path navigation and hidden-file toggle

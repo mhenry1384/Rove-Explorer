@@ -24,6 +24,7 @@ const VIEW_MODES = [
   { id: 'details', label: 'Details', icon: '<path d="M2 3.5h12M2 8h12M2 12.5h12"/>' },
   { id: 'tree', label: 'Tree View', icon: '<path d="M3 2.5v9.5h4M3 7h4"/><rect x="8" y="5" width="6" height="4"/><rect x="8" y="10" width="6" height="4"/>' },
   { id: 'thumbnails', label: 'Thumbnails', icon: '<rect x="2" y="2" width="5" height="5"/><rect x="9" y="2" width="5" height="5"/><rect x="2" y="9" width="5" height="5"/><rect x="9" y="9" width="5" height="5"/>' },
+  { id: 'search', label: 'Search', icon: '<circle cx="6.5" cy="6.5" r="4.5"/><path d="M10 10l4.5 4.5"/>' },
 ];
 let lastEntryClick = { id: null, time: 0 };
 let entryClickTimer = null;
@@ -211,8 +212,13 @@ function sortHeader(key, label) {
 
 async function load(path) {
   const entries = await invoke('read_directory', { path, showHidden: state.showHidden });
-  return sortEntries(entries.map((entry) => ({ ...entry, id: entry.path, extension: entry.kind === 'file' ? extension(entry.name) : '—', displayName: entry.kind === 'file' ? displayName(entry.name) : entry.name })));
+  return sortEntries(entries.map(decorateEntry));
 }
+function decorateEntry(entry) { return { ...entry, id: entry.path, extension: entry.kind === 'file' ? extension(entry.name) : '—', displayName: entry.kind === 'file' ? displayName(entry.name) : entry.name }; }
+// The items a pane's selection and keyboard work on: the search results in Search view, else the folder listing.
+function tabEntries(tab) { return tab?.view === 'search' ? (tab.searchState?.matches || []) : (tab?.entries || []); }
+// Remembers the selected name for the folder, except in Search view, where the item may sit in a subfolder.
+function rememberSelection(tab, entry) { if (tab.path && tab.view !== 'search') remember(tab.path, entry.name); }
 
 // Also refreshes the drive bookmarks, so they pick up drives added or removed since the last listing.
 async function loadDrives() {
@@ -243,10 +249,22 @@ function render() {
   // WebView2 fires blur on a focused input as it is removed; mark the old box so its blur handler
   // doesn't treat being replaced as the user finishing (or abandoning) the rename.
   if (oldRename) oldRename.dataset.replaced = 'true';
+  // The search box is replaced too, so carry over its focus and cursor the same way.
+  const oldSearch = document.activeElement?.matches?.('[data-search-input]') ? document.activeElement : null;
+  const searchSnapshot = oldSearch && { pane: oldSearch.closest('.pane')?.dataset.pane, value: oldSearch.value, start: oldSearch.selectionStart, end: oldSearch.selectionEnd };
   document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE EXPLORER</span><span class="version-tag">v${APP_VERSION}</span></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label><button class="help-button" data-help-menu title="Help" aria-label="Help">Help</button></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${moveButton}${toolbar}${driveBookmarks}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main>`;
   const newRename = renameSnapshot && document.querySelector('[data-rename]');
   if (newRename) { newRename.value = renameSnapshot.value; if (renameSnapshot.focused) { newRename.focus(); newRename.setSelectionRange(renameSnapshot.start, renameSnapshot.end); } }
   bindEvents();
+  const newSearch = searchSnapshot && document.querySelector(`.pane[data-pane="${searchSnapshot.pane}"] [data-search-input]`);
+  if (newSearch) { newSearch.value = searchSnapshot.value; newSearch.focus(); newSearch.setSelectionRange(searchSnapshot.start, searchSnapshot.end); }
+  state.panes.forEach((pane, index) => {
+    const searchState = currentTab(pane)?.searchState;
+    if (!searchState?.autoFocus || searchState.status !== 'done') return;
+    searchState.autoFocus = false;
+    const input = document.querySelector(`.pane[data-pane="${index}"] [data-search-input]`);
+    if (input && !newSearch) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+  });
   document.querySelectorAll('.pane').forEach((el) => {
     const scrollable = el.querySelector('.table-wrap');
     if (!scrollable) return;
@@ -276,16 +294,16 @@ function render() {
 function syncWatchedPaths() {
   const visibleTabs = state.panes.map(currentTab).filter((tab) => tab?.path);
   const paths = [...new Set(visibleTabs.map((tab) => tab.path))];
-  // Tree view totals cover every subfolder, so those roots are watched recursively.
-  const recursivePaths = [...new Set(visibleTabs.filter((tab) => tab.view === 'tree').map((tab) => tab.path))];
+  // Tree view totals and search results cover every subfolder, so those roots are watched recursively.
+  const recursivePaths = [...new Set(visibleTabs.filter((tab) => tab.view === 'tree' || tab.view === 'search').map((tab) => tab.path))];
   const key = `${[...paths].sort().join('|')}#${[...recursivePaths].sort().join('|')}`;
   if (key === lastWatchedKey) return;
   lastWatchedKey = key;
   invoke('set_watched_paths', { paths, recursivePaths }).catch((error) => console.error('set_watched_paths failed', error));
 }
 
-// Tree view rescans automatically when anything under its root changes, but never sooner than
-// TREE_RESCAN_INTERVAL_MS after the previous scan finished (scans of big trees are expensive).
+// Tree and Search views rescan automatically when anything under their root changes, but never sooner
+// than TREE_RESCAN_INTERVAL_MS after the previous scan finished (scans of big trees are expensive).
 const TREE_RESCAN_INTERVAL_MS = 15000;
 const TREE_RESCAN_SETTLE_MS = 1000;
 function isWithin(changedPath, rootPath) {
@@ -293,14 +311,18 @@ function isWithin(changedPath, rootPath) {
   return changed === root || changed.startsWith(`${root}/`);
 }
 
-function scheduleTreeRescans(changedPath) {
+// The scan behind a tab's Tree or Search view, if it's showing one.
+function scanStateOf(tab) { return tab?.view === 'tree' ? tab.treeState : tab?.view === 'search' ? tab.searchState : null; }
+
+function scheduleRescans(changedPath) {
   state.panes.forEach((pane, index) => {
     const tab = currentTab(pane);
-    if (tab?.view === 'tree' && tab.treeState && tab.path && isWithin(changedPath, tab.path)) scheduleTreeRescan(index, tab.treeState);
+    const scan = scanStateOf(tab);
+    if (scan && tab.path && isWithin(changedPath, tab.path)) scheduleRescan(index, scan);
   });
 }
 
-function scheduleTreeRescan(index, treeState) {
+function scheduleRescan(index, treeState) {
   // A change during a scan may or may not have been seen by it, so rescan once it finishes.
   if (treeState.status === 'loading' || treeState.rescanning) { treeState.dirty = true; return; }
   if (treeState.status !== 'done' || treeState.rescanTimer) return;
@@ -310,8 +332,8 @@ function scheduleTreeRescan(index, treeState) {
     treeState.rescanTimer = null;
     const tab = currentTab(state.panes[index]);
     // Skip if the pane has since moved on to another folder, view or tab.
-    if (tab?.treeState !== treeState || tab.view !== 'tree') return;
-    rescanTree(tab);
+    if (scanStateOf(tab) !== treeState) return;
+    if (tab.view === 'tree') rescanTree(tab); else rescanSearch(tab);
   }, delay);
 }
 
@@ -358,7 +380,7 @@ async function reloadTabEntries(tab) {
 async function refreshActivatedTab(index) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.path) return;
-  if (tab.view === 'tree' && tab.treeState) scheduleTreeRescan(index, tab.treeState);
+  if (scanStateOf(tab)) scheduleRescan(index, scanStateOf(tab));
   try { await reloadTabEntries(tab); } catch { return; } // folder may be gone; keep what it showed
   if (currentTab(state.panes[index]) !== tab) return;
   saveSession(); render();
@@ -389,10 +411,11 @@ const SHORTCUTS = [
     [keys(isMac ? '⌘' : 'Ctrl', 'Z'), 'Undo the last delete'],
     [`${keys(isMac ? '⌘' : 'Ctrl', 'C')} ${keys(isMac ? '⌘' : 'Ctrl', 'X')} ${keys(isMac ? '⌘' : 'Ctrl', 'V')}`, 'Copy / cut / paste'],
   ]],
+  ['View', VIEW_MODES.map((mode, i) => [keys(isMac ? '⌥' : 'Alt', String(i + 1)), `${mode.label}`])],
   ['Tabs', [['Middle-click a tab', 'Close it']]],
   ['Help', [[keys('F1'), 'Show this list']]],
 ];
-const APP_DESCRIPTION = 'A focused two-pane file explorer: side-by-side panes with tabs, favorite folders, thumbnails, a folder-size tree view, and copy, cut and paste that work with Explorer and Finder.';
+const APP_DESCRIPTION = 'A focused two-pane file explorer: side-by-side panes with tabs, favorite folders, thumbnails, a folder-size tree view, file-name search, and copy, cut and paste that work with Explorer and Finder.';
 
 // Dialogs live outside #app so re-renders (e.g. a folder refreshing behind one) leave them alone.
 const dialogRoot = document.body.appendChild(document.createElement('div'));
@@ -440,7 +463,7 @@ async function showHelpMenu(button) {
 // Characters the OS won't accept in a file name (macOS reserves ':' because Finder displays it as '/').
 const INVALID_NAME_CHARS = isWindows ? /[\\/:*?"<>|]/ : isMac ? /[/:]/ : /\//;
 function textEditorLabel() { return platformName === 'macos' ? 'Edit in TextEdit' : 'Edit in Notepad'; }
-const TEXT_EDITOR_EXTENSIONS = new Set(['.txt', '.md', '.lst', '.bat']);
+const TEXT_EDITOR_EXTENSIONS = new Set(['.txt', '.md', '.lst', '.bat', '.html', '.htm']);
 function canEditInTextEditor(pane) {
   const entries = selectedFileEntries(pane);
   return (platformName === 'windows' || platformName === 'macos') && entries.length > 0 && entries.every((entry) => entry.kind === 'file' && TEXT_EDITOR_EXTENSIONS.has(extension(entry.name).toLowerCase()));
@@ -516,7 +539,7 @@ function showProperties(menu) {
 }
 
 // The right-click menu is the OS's own, so it can extend past the window and the OS keeps it on screen.
-// `menu` is { pane, kind: 'pane' | 'file' | 'tree', entryId?, path? }.
+// `menu` is { pane, kind: 'pane' | 'file' | 'tree', entryId?, path? }; 'file' also covers search results.
 async function showContextMenu(menu) {
   const { kind, pane } = menu;
   const tab = currentTab(state.panes[pane]);
@@ -524,14 +547,17 @@ async function showContextMenu(menu) {
   const separator = () => PredefinedMenuItem.new({ item: 'Separator' });
   const items = [];
   if (kind === 'pane') {
-    if (tab?.path) items.push(item('New Folder', () => createNewEntry(pane, 'create_folder')), item('New File', () => createNewEntry(pane, 'create_file')));
+    // New items start out being renamed in the folder listing, which Search view doesn't show.
+    if (tab?.path && tab.view !== 'search') items.push(item('New Folder', () => createNewEntry(pane, 'create_folder')), item('New File', () => createNewEntry(pane, 'create_file')));
     items.push(item('Paste', () => pasteIntoPane(pane)));
   } else {
     if (kind === 'file') {
+      const clicked = tab?.view === 'search' && tabEntries(tab).find((candidate) => candidate.id === menu.entryId);
+      if (clicked) items.push(item('Open File Location', () => openFileLocation(pane, clicked)), separator());
       const single = singleSelectedFile(pane);
       if (single && (platformName === 'windows' || platformName === 'macos')) items.push(openWithSubmenu(single), separator());
       items.push(item('Copy', () => copySelected(pane)), item('Cut', () => cutSelected(pane)));
-      const entry = tab?.entries.find((candidate) => candidate.id === menu.entryId);
+      const entry = tabEntries(tab).find((candidate) => candidate.id === menu.entryId);
       if (entry && entry.kind !== 'drive') items.push(item('Rename', () => startRename(pane, entry)));
       if (canEditInTextEditor(pane)) items.push(item(textEditorLabel(), () => editSelectedInTextEditor(pane)));
       if (tab?.path) items.push(item('Compress', () => compressSelected(pane, menu.entryId)));
@@ -555,11 +581,21 @@ function renderTreeNode(node, depth, treeState, isRoot) {
   return row + childrenHtml;
 }
 
+// Must match TREE_MAX_FILES in src-tauri/src/lib.rs.
+const TREE_MAX_FILES = 200000;
+
+function treeProgressText(treeState) {
+  return `Scanning… ${treeState.scannedFolders.toLocaleString()} folders, ${treeState.scannedFiles.toLocaleString()} files so far`;
+}
+
 function renderTreeBody(tab) {
   const treeState = tab.treeState;
   if (!treeState) return '';
   if (treeState.status === 'loading') {
-    return `<div class="tree-progress"><div class="spinner" aria-hidden="true"></div><p>Scanning… ${treeState.scannedFolders.toLocaleString()} folders, ${treeState.scannedFiles.toLocaleString()} files so far</p><button class="tree-cancel" data-tree-cancel>Cancel</button></div>`;
+    return `<div class="tree-progress"><div class="spinner" aria-hidden="true"></div><p data-tree-progress="${escapeAttribute(treeState.requestId)}">${treeProgressText(treeState)}</p><button class="tree-cancel" data-tree-cancel>Cancel</button></div>`;
+  }
+  if (treeState.status === 'too-many') {
+    return `<div class="tree-progress"><p>Too many files. Tree view is limited to ${TREE_MAX_FILES.toLocaleString()} files, and this folder has more than that.</p><button class="tree-cancel" data-tree-cancel>Close</button></div>`;
   }
   if (treeState.status === 'error') {
     return `<div class="tree-progress"><p>Couldn't compute folder stats.</p><button class="tree-cancel" data-tree-cancel>Close</button></div>`;
@@ -568,6 +604,38 @@ function renderTreeBody(tab) {
     return `<div class="tree-rows">${renderTreeNode(treeState.tree, 0, treeState, true)}</div>`;
   }
   return '';
+}
+
+function formatModified(entry) { return entry.modified === '—' ? '—' : new Date(Number(entry.modified) * 1000).toLocaleDateString('en', { month: 'short', day: 'numeric', year: 'numeric' }); }
+
+function searchCountLabel(tab) {
+  const searchState = tab?.searchState;
+  if (searchState?.status !== 'done') return 'SEARCH';
+  return `${searchState.total.toLocaleString()} ${searchState.total === 1 ? 'MATCH' : 'MATCHES'}`;
+}
+
+function renderSearchBody(tab, index, scrollAttrs) {
+  const searchState = tab?.searchState;
+  const message = (content) => `<div class="table-wrap tree-wrap" ${scrollAttrs}><div class="tree-progress">${content}</div></div>`;
+  if (!searchState) return message('');
+  if (searchState.status === 'loading') return message(`<div class="spinner" aria-hidden="true"></div><p data-tree-progress="${escapeAttribute(searchState.requestId)}">${treeProgressText(searchState)}</p><button class="tree-cancel" data-search-cancel>Cancel</button>`);
+  if (searchState.status === 'too-many') return message(`<p>Too many files. Search is limited to ${TREE_MAX_FILES.toLocaleString()} files, and this folder has more than that.</p><button class="tree-cancel" data-search-cancel>Close</button>`);
+  if (searchState.status === 'error') return message(`<p>Couldn't list the files in this folder.</p><button class="tree-cancel" data-search-cancel>Close</button>`);
+  const { total, matches } = searchState;
+  const summary = total === 0 ? 'No matching files'
+    : total > SEARCH_MAX_RESULTS ? `${total.toLocaleString()} matching files · showing the first ${SEARCH_MAX_RESULTS}`
+      : `${total.toLocaleString()} matching file${total === 1 ? '' : 's'}`;
+  const bar = `<div class="search-bar"><input class="search-input" data-search-input value="${escapeAttribute(searchState.query)}" placeholder="Find files whose name contains… (* matches anything, e.g. P*.mov)" aria-label="Search file names" spellcheck="false" autocomplete="off"><span class="search-summary">${summary}</span></div>`;
+  const root = tab.path.replace(/[\\/]+$/, '');
+  const selected = tab.selected || [];
+  const rows = matches.map((entry, entryIndex) => {
+    const folder = parentPath(entry.path);
+    const relative = folder.replace(/[\\/]+$/, '').slice(root.length).replace(/^[\\/]+/, '');
+    const name = isEditing(index, entry) ? `<input class="rename-input" data-rename value="${escapeAttribute(entry.name)}" aria-label="Rename">` : `<strong>${escapeAttribute(entry.name)}</strong>`;
+    return `<button class="file-row ${selected.includes(entry.id) ? 'selected' : ''} ${entry.id === tab.focusId ? 'focused' : ''} ${isCutEntry(entry) ? 'cut' : ''}" data-entry="${escapeAttribute(entry.id)}" data-index="${entryIndex}"><span class="file-name">${renderFileIcon(entry)}${name}</span><span class="search-folder" title="${escapeAttribute(folder)}">${relative ? escapeAttribute(relative) : '<em>this folder</em>'}</span><span>${entry.size}</span><span>${formatModified(entry)}</span></button>`;
+  }).join('');
+  const empty = searchState.paths.length ? '<div class="empty-state"><span>⌁</span><strong>No matching files</strong><small>Try different text.</small></div>' : '<div class="empty-state"><span>⌁</span><strong>No files in this folder</strong><small>There\'s nothing to search here.</small></div>';
+  return `${bar}<div class="table-wrap details-wrap search-wrap" ${scrollAttrs}><div class="table-head"><span>NAME</span><span>FOLDER</span><span>SIZE</span><span>MODIFIED</span></div><div class="rows">${rows || empty}</div></div>`;
 }
 
 function isCutEntry(entry) { return !!(state.clipboard?.cut && state.clipboard.paths.includes(entry.path)); }
@@ -586,7 +654,7 @@ function renderThumbnails(entries, selected, focusId, index) {
 }
 
 function renderPane(pane, index) {
-  const tab = currentTab(pane); const entries = tab?.entries || []; const selected = tab?.selected || []; const focusId = tab?.focusId; const isDriveRoot = tab?.kind === 'drives';
+  const tab = currentTab(pane); const entries = tabEntries(tab); const selected = tab?.selected || []; const focusId = tab?.focusId; const isDriveRoot = tab?.kind === 'drives';
   const view = tab?.view || 'details';
   const headers = isDriveRoot ? '<span>NAME</span><span>TOTAL SIZE</span><span>FREE SPACE</span><span>FILE SYSTEM</span>' : `${sortHeader('name', 'NAME')}${sortHeader('extension', 'EXTENSION')}${sortHeader('size', 'SIZE')}${sortHeader('modified', 'MODIFIED')}`;
   const rows = entries.map((entry, entryIndex) => { const editing = isEditing(index, entry); const name = editing ? `<input class="rename-input" data-rename value="${escapeAttribute(entry.name)}" aria-label="Rename">` : `<strong>${entry.displayName}</strong>`; return `<button class="file-row ${isDriveRoot ? 'drive-row' : ''} ${selected.includes(entry.id) ? 'selected' : ''} ${entry.id === focusId ? 'focused' : ''} ${isCutEntry(entry) ? 'cut' : ''}" data-entry="${entry.id}" data-index="${entryIndex}"><span class="file-name">${renderFileIcon(entry)}${name}</span><span>${isDriveRoot ? entry.total : entry.extension}</span><span>${isDriveRoot ? entry.free : entry.size}</span><span>${isDriveRoot ? entry.fileSystem : (entry.modified === '—' ? '—' : new Date(Number(entry.modified) * 1000).toLocaleDateString('en', { month: 'short', day: 'numeric', year: 'numeric' }))}</span></button>`; }).join('') || '<div class="empty-state"><span>⌁</span><strong>This folder is empty</strong><small>Choose another location to keep moving.</small></div>';
@@ -595,17 +663,19 @@ function renderPane(pane, index) {
     : `<span class="path-segment path-segment-static">${COMPUTER_LABEL}</span>`;
   // The scroll key tells render() whether this is still the same listing; the scroll path is where a folder listing's position is remembered.
   const scrollKey = escapeAttribute(`${view}|${tab?.path ?? ''}`);
-  const scrollPath = tab?.path && view !== 'tree' ? ` data-scroll-path="${escapeAttribute(tab.path)}"` : '';
+  const scrollPath = tab?.path && view !== 'tree' && view !== 'search' ? ` data-scroll-path="${escapeAttribute(tab.path)}"` : '';
   const scrollAttrs = `data-scroll-key="${scrollKey}" data-scroll-view="${view}"${scrollPath}`;
   const body = view === 'tree'
     ? `<div class="table-wrap tree-wrap" ${scrollAttrs}>${renderTreeBody(tab)}</div>`
+    : view === 'search'
+      ? renderSearchBody(tab, index, scrollAttrs)
     : view === 'thumbnails'
       ? `<div class="table-wrap thumb-wrap" ${scrollAttrs}>${renderThumbnails(entries, selected, focusId, index)}</div>`
       : `<div class="table-wrap details-wrap" ${scrollAttrs}><div class="table-head ${isDriveRoot ? 'drive-head' : ''}">${headers}</div><div class="rows">${rows}</div></div>`;
   const undoAction = state.activePane === index && undoStack[undoStack.length - 1];
   const undoLink = undoAction ? `<button class="undo-link" data-undo-delete title="${escapeAttribute(undoDescription(undoAction))}">UNDO DELETE${undoStack.length > 1 ? ` (${undoStack.length})` : ''}</button>` : '';
-  const viewSelect = tab?.path ? `<div class="view-switch" role="group" aria-label="Pane view"><span class="view-label">${VIEW_MODES.find((mode) => mode.id === view)?.label ?? ''}</span>${VIEW_MODES.map((mode) => `<button class="view-button ${mode.id === view ? 'active' : ''}" data-view-mode="${mode.id}" title="${mode.label}" aria-label="${mode.label}" aria-pressed="${mode.id === view}"><svg viewBox="0 0 16 16" aria-hidden="true">${mode.icon}</svg></button>`).join('')}</div>` : '';
-  return `<article class="pane ${state.activePane === index ? 'is-active' : ''}" data-pane="${index}"><div class="tabs">${pane.tabs.map((item, tabIndex) => `<button class="tab ${tabIndex === pane.activeTab ? 'active' : ''}" data-tab="${tabIndex}"><span class="tab-dot"></span>${item.label}${pane.tabs.length > 1 ? '<span class="tab-close" data-tab-close title="Close tab">×</span>' : ''}</button>`).join('')}<button class="new-tab" data-new-tab title="New tab">＋</button></div><div class="pathbar"><button class="nav-button" data-up title="Go up one level" aria-label="Go up one level">↑</button><div class="path-text">${breadcrumb}</div></div>${body}<div class="pane-footer"><div class="pane-status"><span class="selection-label"><span class="item-count">${entries.length} ${entries.length === 1 ? 'ITEM' : 'ITEMS'}</span> · ${selected.length ? `${selected.length} SELECTED` : 'NOTHING SELECTED'}</span>${undoLink}</div>${viewSelect}</div></article>`;
+  const viewSelect = tab?.path ? `<div class="view-switch" role="group" aria-label="Pane view"><span class="view-label">${VIEW_MODES.find((mode) => mode.id === view)?.label ?? ''}</span>${VIEW_MODES.map((mode, modeIndex) => `<button class="view-button ${mode.id === view ? 'active' : ''}" data-view-mode="${mode.id}" title="${mode.label} (${isMac ? '⌥' : 'Alt+'}${modeIndex + 1})" aria-label="${mode.label}" aria-pressed="${mode.id === view}"><svg viewBox="0 0 16 16" aria-hidden="true">${mode.icon}</svg></button>`).join('')}</div>` : '';
+  return `<article class="pane ${state.activePane === index ? 'is-active' : ''}" data-pane="${index}"><div class="tabs">${pane.tabs.map((item, tabIndex) => `<button class="tab ${tabIndex === pane.activeTab ? 'active' : ''}" data-tab="${tabIndex}"><span class="tab-dot"></span>${item.label}${pane.tabs.length > 1 ? '<span class="tab-close" data-tab-close title="Close tab">×</span>' : ''}</button>`).join('')}<button class="new-tab" data-new-tab title="New tab">＋</button></div><div class="pathbar"><button class="nav-button" data-up title="Go up one level" aria-label="Go up one level">↑</button><div class="path-text">${breadcrumb}</div></div>${body}<div class="pane-footer"><div class="pane-status"><span class="selection-label"><span class="item-count">${view === 'search' ? searchCountLabel(tab) : `${entries.length} ${entries.length === 1 ? 'ITEM' : 'ITEMS'}`}</span> · ${selected.length ? `${selected.length} SELECTED` : 'NOTHING SELECTED'}</span>${undoLink}</div>${viewSelect}</div></article>`;
 }
 
 const HISTORY_LIMIT = 25;
@@ -623,7 +693,9 @@ async function navigateTabTo(index, path, { recordHistory = true, historyIndex }
   if (!tab) return;
   state.activePane = index;
   const wasTreeView = tab.view === 'tree';
-  if (wasTreeView && tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
+  const wasSearchView = tab.view === 'search';
+  const searchQuery = tab.searchState?.query || '';
+  if (wasTreeView || wasSearchView) cancelScan(tab);
   const entries = path ? await load(path) : await loadDrives();
   tab.path = path; tab.kind = path ? 'folder' : 'drives'; tab.label = path ? (path.split(/[\\/]/).filter(Boolean).pop() || path) : COMPUTER_LABEL; tab.entries = entries;
   const selection = rememberedOrFirst(entries, path ? stored[path]?.name : null);
@@ -633,6 +705,12 @@ async function navigateTabTo(index, path, { recordHistory = true, historyIndex }
   if (wasTreeView) {
     if (path) { tab.treeState = null; startTreeView(index); return; }
     tab.view = 'details'; tab.treeState = null;
+  }
+  // Search view stays on and searches the new folder for the same text.
+  if (wasSearchView) {
+    tab.searchState = null;
+    if (path) { startSearchView(index, searchQuery); return; }
+    tab.view = 'details';
   }
   render();
 }
@@ -671,7 +749,7 @@ document.addEventListener('pointerdown', (event) => {
   if (!input || !state.editing || event.target.closest?.('[data-rename]')) return;
   const sameRow = !!input.closest('[data-entry]') && event.target.closest?.('[data-entry]') === input.closest('[data-entry]');
   const { pane: index, entryId } = state.editing;
-  const entry = currentTab(state.panes[index])?.entries.find((item) => item.id === entryId);
+  const entry = tabEntries(currentTab(state.panes[index])).find((item) => item.id === entryId);
   input.dataset.replaced = 'true'; // its blur handler would otherwise commit a second time
   finishRename(index, entry, input.value).catch(() => cancelRename());
   if (sameRow) { event.preventDefault(); event.stopPropagation(); swallowClickAfterRename = true; }
@@ -697,7 +775,17 @@ async function finishRename(index, entry, value) {
     await message(text, { title: 'Rename failed', kind: 'error' });
     return;
   }
-  const pane = state.panes[index]; const tab = currentTab(pane); tab.entries = await load(tab.path);
+  const pane = state.panes[index]; const tab = currentTab(pane);
+  if (tab.view === 'search' && tab.searchState) {
+    const newPath = joinPath(parentPath(entry.path), newName);
+    replaceInSearchIndex(tab.searchState, entry.path, newPath);
+    selectSingle(tab, newPath);
+    await updateSearchMatches(tab);
+    tab.entries = await load(tab.path);
+    scrollSelectionIntoView = true; render();
+    return;
+  }
+  tab.entries = await load(tab.path);
   selectSingle(tab, tab.entries.find((item) => item.name === newName)?.id || null);
   saveSession(); scrollSelectionIntoView = true; render();
 }
@@ -739,10 +827,7 @@ async function undoDelete() {
 async function showRestored(index, action) {
   const tab = currentTab(state.panes[index]);
   if (!tab) return;
-  if (tab.view === 'tree') {
-    if (tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
-    tab.view = 'details'; tab.treeState = null;
-  }
+  if (tab.view === 'tree' || tab.view === 'search') { cancelScan(tab); leaveSearch(tab); tab.view = 'details'; tab.treeState = null; }
   await navigateTabTo(index, action.folder);
   const restored = new Set(action.entries.map((entry) => normalizePath(entry.path)));
   const ids = tab.entries.filter((entry) => restored.has(normalizePath(entry.path))).map((entry) => entry.id);
@@ -756,9 +841,14 @@ async function deleteEntries(index, entries) {
   if (!targets.length) return;
   const pane = state.panes[index]; const tab = currentTab(pane);
   const { trashed, failures } = await invoke('delete_entries', { paths: targets.map((entry) => entry.path) });
-  rememberDelete(tab.path, trashed);
+  // Search results can come from any subfolder; Undo reopens the folder the first one was in.
+  rememberDelete(tab.view === 'search' ? parentPath(targets[0].path) : tab.path, trashed);
   const failedPaths = new Set(failures.map((failure) => failure.path));
   const deletedIds = new Set(targets.filter((entry) => !failedPaths.has(entry.path)).map((entry) => entry.id));
+  if (tab.view === 'search' && tab.searchState) {
+    removeFromSearchIndex(tab.searchState, deletedIds);
+    await updateSearchMatches(tab);
+  }
   tab.entries = await load(tab.path);
   tab.selected = (tab.selected || []).filter((id) => !deletedIds.has(id));
   if (deletedIds.has(tab.focusId)) tab.focusId = null;
@@ -777,7 +867,7 @@ async function showDeleteFailures(failures) {
 function deleteSelected(index) {
   const pane = state.panes[index]; const tab = currentTab(pane);
   if (tab?.view === 'tree') { if (tab.treeState?.selected) deleteTreeNode(index, tab.treeState.selected); return; }
-  const entries = (tab?.selected || []).map((id) => tab.entries.find((item) => item.id === id)).filter(Boolean);
+  const entries = (tab?.selected || []).map((id) => tabEntries(tab).find((item) => item.id === id)).filter(Boolean);
   if (entries.length) deleteEntries(index, entries);
 }
 
@@ -785,7 +875,7 @@ function selectedFileEntries(index) {
   const tab = currentTab(state.panes[index]);
   if (!tab) return [];
   const ids = new Set(tab.selected || []);
-  return tab.entries.filter((entry) => ids.has(entry.id) && entry.kind !== 'drive');
+  return tabEntries(tab).filter((entry) => ids.has(entry.id) && entry.kind !== 'drive');
 }
 
 async function copySelected(index) {
@@ -861,6 +951,8 @@ async function compressSelected(index, entryId) {
   try { archivePath = await invoke('compress_entries', { paths: ordered.map((entry) => entry.path) }); } catch (error) { await message(String(error), { title: 'Compress failed', kind: 'error' }); return; }
   // Skip selecting the archive if the pane has moved on while it was being written.
   if (currentTab(state.panes[index]) !== tab || tab.path !== folderPath) return;
+  // In Search view the archive turns up in the results once the rescan sees it.
+  if (tab.view === 'search') { render(); return; }
   tab.entries = await load(tab.path);
   const entry = tab.entries.find((item) => item.path === archivePath);
   if (!entry) { render(); return; }
@@ -873,7 +965,7 @@ async function compressSelected(index, entryId) {
 async function startEntryDrag(index, entry) {
   const tab = currentTab(state.panes[index]);
   const selected = new Set(tab?.selected || []);
-  const dragEntries = selected.has(entry.id) ? tab.entries.filter((item) => selected.has(item.id)) : [entry];
+  const dragEntries = selected.has(entry.id) ? tabEntries(tab).filter((item) => selected.has(item.id)) : [entry];
   const paths = dragEntries.map((item) => item.path);
   if (!paths.length || !dragIconPath) return;
   internalDragPaths = paths;
@@ -903,7 +995,7 @@ function dropTargetAt(position) {
   const tab = currentTab(state.panes[paneIndex]);
   if (!tab) return null;
   const rowEl = el.closest('[data-entry]');
-  const row = rowEl && tab.entries[Number(rowEl.dataset.index)];
+  const row = rowEl && tabEntries(tab)[Number(rowEl.dataset.index)];
   const destDir = row && (row.kind === 'folder' || row.kind === 'drive') ? row.path : tab.path;
   if (!destDir) return null;
   return { paneIndex, destDir, hoverEl: row ? rowEl : paneEl };
@@ -981,6 +1073,15 @@ function setupExternalDragDrop() {
 
 function handleTypeAhead(index, char) {
   const tab = currentTab(state.panes[index]);
+  // In Search view, typing goes into the search box.
+  if (tab?.view === 'search') {
+    const input = document.querySelector(`.pane[data-pane="${index}"] [data-search-input]`);
+    if (!input) return;
+    input.focus();
+    input.value += char;
+    input.dispatchEvent(new Event('input'));
+    return;
+  }
   const entries = tab?.entries;
   if (!entries?.length || tab.view === 'tree') return;
   const now = Date.now();
@@ -1050,7 +1151,7 @@ async function navigateToPath(index, path) {
 
 async function enter(paneIndex, entry) {
   if (!entry) return;
-  const tab = currentTab(state.panes[paneIndex]); remember(tab.path, entry.name);
+  const tab = currentTab(state.panes[paneIndex]); rememberSelection(tab, entry);
   if (entry.kind === 'drive' || entry.kind === 'folder') { await navigateTabTo(paneIndex, entry.path); } else { try { await openPath(entry.path); } catch (error) { console.error('openPath failed', entry.path, error); } }
 }
 
@@ -1071,7 +1172,7 @@ async function goUp(index) {
 }
 
 function moveSelection(index, direction, extend) {
-  const pane = state.panes[index]; const tab = currentTab(pane); const entries = tab?.entries || [];
+  const pane = state.panes[index]; const tab = currentTab(pane); const entries = tabEntries(tab);
   if (!entries.length) return;
   const current = entries.findIndex((entry) => entry.id === tab.focusId);
   const next = current < 0 ? (direction > 0 ? 0 : entries.length - 1) : Math.max(0, Math.min(entries.length - 1, current + direction));
@@ -1082,7 +1183,7 @@ function moveSelection(index, direction, extend) {
   } else {
     selectSingle(tab, nextEntry.id);
   }
-  if (tab.path) remember(tab.path, nextEntry.name);
+  rememberSelection(tab, nextEntry);
   saveSession(); scrollSelectionIntoView = true; render();
 }
 
@@ -1122,7 +1223,7 @@ function closeTab(index, tabIndex) {
   const pane = state.panes[index];
   const tab = pane.tabs[tabIndex];
   if (!tab || pane.tabs.length <= 1) return;
-  if (tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
+  cancelScan(tab);
   const closingActive = tabIndex === pane.activeTab;
   if (state.editing?.pane === index && closingActive) state.editing = null;
   pane.tabs.splice(tabIndex, 1);
@@ -1140,12 +1241,167 @@ function cancelTreeView(index) {
   render();
 }
 
+// Stops a tab's Tree or Search scan, including a rescan that's waiting to start.
+function cancelScan(tab) {
+  for (const scan of [tab?.treeState, tab?.searchState]) {
+    if (!scan) continue;
+    if (scan.requestId) invoke('cancel_tree_stats', { requestId: scan.requestId }).catch(() => {});
+    clearTimeout(scan.rescanTimer); scan.rescanTimer = null;
+  }
+}
+
+// Search view: lists every file under the tab's folder once (the same limit as Tree view), keeps the
+// names in memory, and shows the files whose name contains the search text, at most SEARCH_MAX_RESULTS.
+const SEARCH_MAX_RESULTS = 100;
+
+function startSearchView(index, query = '') {
+  const tab = currentTab(state.panes[index]);
+  if (!tab?.path) return;
+  const requestId = `search-${index}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // The folder listing's selection comes back when the tab leaves Search view.
+  const saved = { selected: tab.selected, focusId: tab.focusId, anchorId: tab.anchorId };
+  tab.view = 'search';
+  tab.searchState = { requestId, status: 'loading', scannedFiles: 0, scannedFolders: 0, paths: [], names: [], query, total: 0, matches: [], saved, querySeq: 0, autoFocus: true };
+  tab.selected = []; tab.focusId = null; tab.anchorId = null;
+  render();
+  runSearchScan(tab, tab.searchState, requestId);
+}
+
+// Unlike startSearchView, keeps showing the current results until the new scan arrives.
+function rescanSearch(tab) {
+  const searchState = tab.searchState;
+  const requestId = `search-rescan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  searchState.requestId = requestId; searchState.rescanning = true; searchState.dirty = false;
+  runSearchScan(tab, searchState, requestId);
+}
+
+async function runSearchScan(tab, searchState, requestId) {
+  const isCurrent = () => tab.searchState === searchState && searchState.requestId === requestId;
+  let result;
+  try {
+    result = await invoke('scan_file_names', { requestId, path: tab.path, showHidden: state.showHidden });
+  } catch {
+    if (!isCurrent()) return;
+    if (searchState.rescanning) { searchState.rescanning = false; return; } // keep the results already showing
+    searchState.status = 'error';
+    render();
+    return;
+  }
+  if (!isCurrent() || result.status === 'cancelled') return;
+  searchState.rescanning = false;
+  if (result.status === 'too-many') {
+    Object.assign(searchState, { status: 'too-many', paths: [], names: [], matches: [], total: 0 });
+    selectSingle(tab, null);
+    render();
+    return;
+  }
+  searchState.paths = result.paths;
+  searchState.names = result.paths.map((path) => itemName(path).toLowerCase());
+  searchState.status = 'done';
+  searchState.lastScanEnd = Date.now();
+  if (searchState.dirty) {
+    searchState.dirty = false;
+    const paneIndex = state.panes.findIndex((pane) => currentTab(pane) === tab);
+    if (paneIndex !== -1) scheduleRescan(paneIndex, searchState);
+  }
+  await updateSearchMatches(tab);
+}
+
+// Plain text matches anywhere in a (lowercased) name. Text with a * is a wildcard pattern for the whole
+// name, * standing for any run of characters: "p*.mov" finds names that start with p and end with .mov.
+function searchMatcher(query) {
+  const text = query.toLowerCase();
+  if (!text.includes('*')) return (name) => name.includes(text);
+  const pattern = new RegExp(`^${text.split('*').map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, 's');
+  return (name) => pattern.test(name);
+}
+
+// Re-runs the search text against the names in memory, then looks up size and date for the files shown.
+async function updateSearchMatches(tab) {
+  const searchState = tab.searchState;
+  if (searchState?.status !== 'done') return;
+  const matches = searchMatcher(searchState.query);
+  const shown = [];
+  let total = 0;
+  searchState.names.forEach((name, i) => {
+    if (!matches(name)) return;
+    total += 1;
+    if (shown.length < SEARCH_MAX_RESULTS) shown.push(searchState.paths[i]);
+  });
+  // Typing fires a search per keystroke; only the latest one gets to update the view.
+  const seq = ++searchState.querySeq;
+  let entries = [];
+  try { entries = await invoke('stat_entries', { paths: shown }); } catch (error) { console.error('stat_entries failed', error); }
+  if (tab.searchState !== searchState || searchState.querySeq !== seq) return;
+  searchState.total = total;
+  searchState.matches = entries.map(decorateEntry);
+  const ids = new Set(searchState.matches.map((entry) => entry.id));
+  const kept = (tab.selected || []).filter((id) => ids.has(id));
+  if (kept.length) {
+    tab.selected = kept;
+    if (!ids.has(tab.focusId)) tab.focusId = kept[kept.length - 1];
+    if (!ids.has(tab.anchorId)) tab.anchorId = tab.focusId;
+  } else {
+    selectSingle(tab, searchState.matches[0]?.id || null);
+  }
+  render();
+}
+
+function replaceInSearchIndex(searchState, oldPath, newPath) {
+  const i = searchState.paths.indexOf(oldPath);
+  if (i === -1) return;
+  searchState.paths[i] = newPath;
+  searchState.names[i] = itemName(newPath).toLowerCase();
+}
+
+function removeFromSearchIndex(searchState, removedPaths) {
+  const keep = searchState.paths.map((path) => !removedPaths.has(path));
+  searchState.paths = searchState.paths.filter((_, i) => keep[i]);
+  searchState.names = searchState.names.filter((_, i) => keep[i]);
+}
+
+// Puts back the folder listing's selection from before Search view.
+function leaveSearch(tab) {
+  const saved = tab?.searchState?.saved;
+  if (!tab?.searchState) return;
+  tab.searchState = null;
+  const ids = (saved?.selected || []).filter((id) => tab.entries.some((entry) => entry.id === id));
+  if (ids.length) { tab.selected = ids; tab.focusId = ids.includes(saved.focusId) ? saved.focusId : ids[ids.length - 1]; tab.anchorId = ids.includes(saved.anchorId) ? saved.anchorId : tab.focusId; }
+  else selectSingle(tab, firstEntryId(tab.entries));
+}
+
+function cancelSearchView(index) {
+  const tab = currentTab(state.panes[index]);
+  if (!tab) return;
+  cancelScan(tab); leaveSearch(tab); tab.view = 'details';
+  render();
+}
+
+// Shows the folder a search result is in, in Details view, with the file selected.
+async function openFileLocation(index, entry) {
+  const tab = currentTab(state.panes[index]);
+  if (!tab) return;
+  cancelScan(tab); tab.searchState = null; tab.view = 'details';
+  await navigateTabTo(index, parentPath(entry.path));
+  if (currentTab(state.panes[index]) !== tab) return;
+  const target = tab.entries.find((item) => normalizePath(item.path) === normalizePath(entry.path));
+  if (target) { selectSingle(tab, target.id); remember(tab.path, target.name); }
+  saveSession(); scrollSelectionIntoView = true; render();
+}
+
+function findTabBySearchRequest(requestId) {
+  for (const pane of state.panes) for (const tab of pane.tabs) if (tab.searchState?.requestId === requestId) return tab;
+  return null;
+}
+
 function setPaneView(index, view) {
   const tab = currentTab(state.panes[index]);
   if (!tab) return;
-  if (tab.view === 'tree' && tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
+  cancelScan(tab);
   tab.treeState = null;
+  leaveSearch(tab);
   if (view === 'tree') { startTreeView(index); return; }
+  if (view === 'search') { startSearchView(index); return; }
   tab.view = view;
   render();
 }
@@ -1229,7 +1485,7 @@ function bindEvents() {
       const activate = (event, fromPointer) => {
         event.stopPropagation();
         const tab = currentTab(pane);
-        const entry = tab.entries[Number(row.dataset.index)];
+        const entry = tabEntries(tab)[Number(row.dataset.index)];
         state.activePane = index;
         if (state.editing) return;
         // On a Mac, Ctrl+click is a right-click, so only Command toggles the selection.
@@ -1238,9 +1494,9 @@ function bindEvents() {
           if (!tab.anchorId) tab.anchorId = tab.focusId || entry.id;
           // Ctrl+Shift adds the range to what's already selected instead of replacing it.
           const previous = isToggle ? tab.selected : [];
-          selectRange(tab, tab.entries, tab.anchorId, entry.id);
-          if (isToggle) { const ids = new Set([...previous, ...tab.selected]); tab.selected = tab.entries.filter((item) => ids.has(item.id)).map((item) => item.id); }
-          if (tab.path) remember(tab.path, entry.name);
+          selectRange(tab, tabEntries(tab), tab.anchorId, entry.id);
+          if (isToggle) { const ids = new Set([...previous, ...tab.selected]); tab.selected = tabEntries(tab).filter((item) => ids.has(item.id)).map((item) => item.id); }
+          rememberSelection(tab, entry);
           saveSession(); render();
           return;
         }
@@ -1250,9 +1506,9 @@ function bindEvents() {
           lastEntryClick = { id: null, time: 0 };
           const ids = new Set(tab.selected);
           if (ids.has(entry.id)) ids.delete(entry.id); else ids.add(entry.id);
-          tab.selected = tab.entries.filter((item) => ids.has(item.id)).map((item) => item.id);
+          tab.selected = tabEntries(tab).filter((item) => ids.has(item.id)).map((item) => item.id);
           tab.focusId = entry.id; tab.anchorId = entry.id;
-          if (tab.path && ids.has(entry.id)) remember(tab.path, entry.name);
+          if (ids.has(entry.id)) rememberSelection(tab, entry);
           saveSession(); render();
           return;
         }
@@ -1272,7 +1528,7 @@ function bindEvents() {
           entryClickTimer = setTimeout(() => startRename(index, entry), DOUBLE_CLICK_MS);
           return;
         }
-        selectSingle(tab, entry.id); if (tab.path) remember(tab.path, entry.name); saveSession(); render();
+        selectSingle(tab, entry.id); rememberSelection(tab, entry); saveSession(); render();
       };
       // pointerdown fires immediately; the derived `click` event can lag ~200ms behind it on
       // Windows precision touchpads/touchscreens while the OS gesture recognizer rules out a
@@ -1299,10 +1555,10 @@ function bindEvents() {
         event.preventDefault(); event.stopPropagation();
         if (state.editing) return;
         const tab = currentTab(pane);
-        const entry = tab.entries[Number(row.dataset.index)];
+        const entry = tabEntries(tab)[Number(row.dataset.index)];
         if (entry.kind === 'drive') return;
         state.activePane = index;
-        if (!(tab.selected || []).includes(entry.id)) { selectSingle(tab, entry.id); if (tab.path) remember(tab.path, entry.name); }
+        if (!(tab.selected || []).includes(entry.id)) { selectSingle(tab, entry.id); rememberSelection(tab, entry); }
         render();
         showContextMenu({ pane: index, kind: 'file', entryId: entry.id });
       });
@@ -1331,6 +1587,20 @@ function bindEvents() {
       if (currentTab(pane)?.view !== button.dataset.viewMode) setPaneView(index, button.dataset.viewMode); else render();
     }));
     element.querySelector('[data-tree-cancel]')?.addEventListener('click', (event) => { event.stopPropagation(); cancelTreeView(index); });
+    element.querySelector('[data-search-cancel]')?.addEventListener('click', (event) => { event.stopPropagation(); cancelSearchView(index); });
+    const searchInput = element.querySelector('[data-search-input]');
+    searchInput?.addEventListener('click', (event) => { event.stopPropagation(); if (state.activePane !== index) { state.activePane = index; render(); } });
+    searchInput?.addEventListener('input', () => {
+      const tab = currentTab(pane);
+      if (!tab?.searchState) return;
+      tab.searchState.query = searchInput.value;
+      updateSearchMatches(tab);
+    });
+    // Up/Down leave the box for the results; Enter opens the selected result.
+    searchInput?.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); searchInput.blur(); state.activePane = index; moveSelection(index, event.key === 'ArrowUp' ? -1 : 1, event.shiftKey); return; }
+      if (event.key === 'Enter') { event.preventDefault(); const tab = currentTab(pane); enter(index, tabEntries(tab).find((entry) => entry.id === tab.focusId)); }
+    });
     element.querySelectorAll('[data-tree-node]').forEach((row) => {
       row.addEventListener('click', (event) => {
         event.stopPropagation();
@@ -1363,7 +1633,7 @@ function bindEvents() {
   document.querySelector('[data-go-forward]')?.addEventListener('click', () => goForward(state.activePane));
   document.querySelector('[data-move-to-other-pane]')?.addEventListener('click', () => moveSelectedToOtherPane().catch((error) => console.error('move to other pane failed', error)));
   document.querySelector('[data-help-menu]').addEventListener('click', (event) => showHelpMenu(event.currentTarget));
-  document.querySelector('#hidden-toggle').addEventListener('change', async (event) => { state.showHidden = event.currentTarget.checked; await Promise.all(state.panes.flatMap((pane) => pane.tabs.filter((tab) => tab.path).map(async (tab) => { tab.entries = await load(tab.path); }))); render(); });
+  document.querySelector('#hidden-toggle').addEventListener('change', async (event) => { state.showHidden = event.currentTarget.checked; await Promise.all(state.panes.flatMap((pane) => pane.tabs.filter((tab) => tab.path).map(async (tab) => { tab.entries = await load(tab.path); }))); state.panes.forEach((pane) => { const tab = currentTab(pane); if (tab?.view === 'search' && tab.searchState?.status === 'done') rescanSearch(tab); }); render(); });
   const locationInput = document.querySelector('#location-input');
   // Select everything on focus; the mouseup that follows a click-to-focus would otherwise drop the selection to a caret.
   let justFocusedLocation = false;
@@ -1371,7 +1641,7 @@ function bindEvents() {
   locationInput.addEventListener('mouseup', (event) => { if (justFocusedLocation) event.preventDefault(); justFocusedLocation = false; });
   locationInput.addEventListener('blur', () => { justFocusedLocation = false; });
   locationInput.addEventListener('keydown', (event) => { if (event.key !== 'Enter') return; event.preventDefault(); const input = event.currentTarget; navigatePath(input.value).catch(() => input.select()); });
-  const renameInput = document.querySelector('[data-rename]'); renameInput?.addEventListener('click', (event) => event.stopPropagation()); renameInput?.addEventListener('keyup', (event) => { if (event.key === ' ') event.preventDefault(); /* else releasing Space "presses" the row button the box sits in */ }); renameInput?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelRename(); } if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); } }); renameInput?.addEventListener('blur', (event) => { if (event.currentTarget.dataset.replaced) return; const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); if (entry) finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); });
+  const renameInput = document.querySelector('[data-rename]'); renameInput?.addEventListener('click', (event) => event.stopPropagation()); renameInput?.addEventListener('keyup', (event) => { if (event.key === ' ') event.preventDefault(); /* else releasing Space "presses" the row button the box sits in */ }); renameInput?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelRename(); } if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); const entry = tabEntries(currentTab(state.panes[state.activePane])).find((item) => item.id === state.editing?.entryId); finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); } }); renameInput?.addEventListener('blur', (event) => { if (event.currentTarget.dataset.replaced) return; const entry = tabEntries(currentTab(state.panes[state.activePane])).find((item) => item.id === state.editing?.entryId); if (entry) finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); });
 }
 
 document.addEventListener('keydown', (event) => {
@@ -1387,18 +1657,27 @@ document.addEventListener('keydown', (event) => {
   if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'v') { event.preventDefault(); pasteIntoPane(state.activePane); return; }
   if (event.key === 'Delete' && !isTyping) { event.preventDefault(); deleteSelected(state.activePane); return; }
   // In a Mac text field Option+arrow moves by word, so there it only navigates outside of one.
+  // Alt+1…4 switch the active pane's view, even from the search box. event.code, since on a Mac
+  // Option+digit types a symbol rather than the digit.
+  const viewDigit = /^Digit([1-9])$/.exec(event.code);
+  const viewMode = event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && viewDigit && VIEW_MODES[Number(viewDigit[1]) - 1];
+  if (viewMode) {
+    event.preventDefault();
+    if (tab?.path && tab.view !== viewMode.id) setPaneView(state.activePane, viewMode.id);
+    return;
+  }
   if (event.altKey && event.key === 'ArrowLeft' && !(isMac && isTyping)) { event.preventDefault(); goBack(state.activePane); return; }
   if (event.altKey && event.key === 'ArrowRight' && !(isMac && isTyping)) { event.preventDefault(); goForward(state.activePane); return; }
   if (isTyping) return;
   // Finder's shortcuts: ⌘⌫ to Trash (Mac laptops have no forward-Delete key), ⌘[ / ⌘] back and
   // forward, ⌘↑ to the enclosing folder, ⌘↓ to open.
   if (isMac && event.metaKey && !event.altKey) {
-    const action = { Backspace: () => deleteSelected(state.activePane), '[': () => goBack(state.activePane), ']': () => goForward(state.activePane), ArrowUp: () => goUp(state.activePane), ArrowDown: () => enter(state.activePane, tab?.view !== 'tree' && tab?.entries.find((entry) => entry.id === tab.focusId)) }[event.key];
+    const action = { Backspace: () => deleteSelected(state.activePane), '[': () => goBack(state.activePane), ']': () => goForward(state.activePane), ArrowUp: () => goUp(state.activePane), ArrowDown: () => enter(state.activePane, tab?.view !== 'tree' && tabEntries(tab).find((entry) => entry.id === tab.focusId)) }[event.key];
     if (action) { event.preventDefault(); action(); return; }
   }
   if (event.key === 'F2') {
     event.preventDefault();
-    const entry = tab?.view !== 'tree' && tab?.entries.find((item) => item.id === tab.focusId);
+    const entry = tab?.view !== 'tree' && tabEntries(tab).find((item) => item.id === tab.focusId);
     if (entry && entry.kind !== 'drive') { clearTimeout(entryClickTimer); startRename(state.activePane, entry); }
     return;
   }
@@ -1412,7 +1691,7 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveSelection(state.activePane, event.key === 'ArrowUp' ? -1 : 1, event.shiftKey); return; }
   if ((event.key === 'Home' || event.key === 'End') && tab?.view !== 'tree') { event.preventDefault(); moveSelection(state.activePane, event.key === 'Home' ? -Infinity : Infinity, event.shiftKey); return; }
   if (event.key === 'Enter' && tab?.view === 'tree') { event.preventDefault(); if (tab.treeState?.selected) openTreeNode(state.activePane, tab.treeState.selected); return; }
-  if (event.key === 'Enter') { event.preventDefault(); enter(state.activePane, tab?.entries.find((entry) => entry.id === tab.focusId)); return; }
+  if (event.key === 'Enter') { event.preventDefault(); enter(state.activePane, tabEntries(tab).find((entry) => entry.id === tab.focusId)); return; }
   if (event.key === 'Backspace') { event.preventDefault(); goUp(state.activePane); return; }
   if (!event.ctrlKey && !event.altKey && !event.metaKey && event.key.length === 1) { event.preventDefault(); handleTypeAhead(state.activePane, event.key); }
 });
@@ -1433,7 +1712,7 @@ document.addEventListener('pointerup', () => {
   if (renameOnRelease) { entryClickTimer = setTimeout(() => startRename(index, entry), DOUBLE_CLICK_MS); return; }
   if (selectOnRelease) {
     const tab = currentTab(state.panes[index]);
-    selectSingle(tab, entry.id); if (tab.path) remember(tab.path, entry.name); saveSession(); render();
+    selectSingle(tab, entry.id); rememberSelection(tab, entry); saveSession(); render();
   }
 });
 document.addEventListener('pointercancel', () => { pendingPress = null; });
@@ -1490,12 +1769,32 @@ listen('drives-changed', async () => {
   }
   render();
 });
-listen('fs-changed', (event) => { scheduleFolderReload(event.payload); scheduleTreeRescans(event.payload); });
+listen('fs-changed', (event) => { scheduleFolderReload(event.payload); scheduleRescans(event.payload); });
 listen('tree-progress', (event) => {
   const tab = findTabByTreeRequest(event.payload.requestId);
   if (!tab || tab.treeState.status !== 'loading') return;
   tab.treeState.scannedFiles = event.payload.scannedFiles;
   tab.treeState.scannedFolders = event.payload.scannedFolders;
+  // Update the counter in place: a full render() replaces the Cancel button several times a
+  // second, so a click on it would land on a button that's already gone and never fire.
+  document.querySelectorAll('[data-tree-progress]').forEach((element) => {
+    if (element.dataset.treeProgress === event.payload.requestId) element.textContent = treeProgressText(tab.treeState);
+  });
+});
+listen('search-progress', (event) => {
+  const tab = findTabBySearchRequest(event.payload.requestId);
+  if (!tab || tab.searchState.status !== 'loading') return;
+  tab.searchState.scannedFiles = event.payload.scannedFiles;
+  tab.searchState.scannedFolders = event.payload.scannedFolders;
+  document.querySelectorAll('[data-tree-progress]').forEach((element) => {
+    if (element.dataset.treeProgress === event.payload.requestId) element.textContent = treeProgressText(tab.searchState);
+  });
+});
+listen('tree-too-many', (event) => {
+  const tab = findTabByTreeRequest(event.payload.requestId);
+  if (!tab) return;
+  clearTimeout(tab.treeState.rescanTimer);
+  tab.treeState = { ...tab.treeState, status: 'too-many', tree: null, rescanning: false, rescanTimer: null };
   render();
 });
 listen('tree-done', (event) => {
@@ -1510,7 +1809,7 @@ listen('tree-done', (event) => {
   if (treeState.dirty) {
     treeState.dirty = false;
     const paneIndex = state.panes.findIndex((pane) => currentTab(pane) === tab);
-    if (paneIndex !== -1) scheduleTreeRescan(paneIndex, treeState);
+    if (paneIndex !== -1) scheduleRescan(paneIndex, treeState);
   }
   render();
 });

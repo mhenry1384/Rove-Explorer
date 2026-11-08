@@ -189,6 +189,36 @@ fn list_drives() -> Vec<Drive> {
     drives
 }
 
+fn entry_from_metadata(path: &Path, name: String, metadata: &fs::Metadata) -> Entry {
+    let is_dir = metadata.is_dir();
+    let extension = if is_dir { "—".to_string() } else {
+        Path::new(&name).extension().map(|value| format!(".{}", value.to_string_lossy())).unwrap_or_else(|| "—".to_string())
+    };
+    Entry {
+        kind: if is_dir { "folder" } else { "file" }.to_string(),
+        name,
+        extension,
+        size: if is_dir { "—".to_string() } else { format_size(metadata.len()) },
+        bytes: if is_dir { 0 } else { metadata.len() },
+        modified: metadata.modified().ok().and_then(|date| date.duration_since(std::time::UNIX_EPOCH).ok()).map(|date| date.as_secs().to_string()).unwrap_or_else(|| "—".to_string()),
+        path: path.to_string_lossy().to_string(),
+    }
+}
+
+// Listing details for the given paths (the search results on screen); paths that are gone are left out.
+#[tauri::command]
+fn stat_entries(paths: Vec<String>) -> Vec<Entry> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let path = Path::new(path);
+            let metadata = fs::metadata(path).ok()?;
+            let name = path.file_name()?.to_string_lossy().to_string();
+            Some(entry_from_metadata(path, name, &metadata))
+        })
+        .collect()
+}
+
 #[tauri::command]
 fn read_directory(path: String, show_hidden: bool) -> Result<Vec<Entry>, String> {
     let mut entries = fs::read_dir(&path).map_err(|error| error.to_string())?
@@ -197,19 +227,7 @@ fn read_directory(path: String, show_hidden: bool) -> Result<Vec<Entry>, String>
             let metadata = item.metadata().ok()?;
             let name = item.file_name().to_string_lossy().to_string();
             if !show_hidden && is_hidden(&item.path(), &name) { return None; }
-            let is_dir = metadata.is_dir();
-            let extension = if is_dir { "—".to_string() } else {
-                Path::new(&name).extension().map(|value| format!(".{}", value.to_string_lossy())).unwrap_or_else(|| "—".to_string())
-            };
-            Some(Entry {
-                kind: if is_dir { "folder" } else { "file" }.to_string(),
-                name,
-                extension,
-                size: if is_dir { "—".to_string() } else { format_size(metadata.len()) },
-                bytes: if is_dir { 0 } else { metadata.len() },
-                modified: metadata.modified().ok().and_then(|date| date.duration_since(std::time::UNIX_EPOCH).ok()).map(|date| date.as_secs().to_string()).unwrap_or_else(|| "—".to_string()),
-                path: item.path().to_string_lossy().to_string(),
-            })
+            Some(entry_from_metadata(&item.path(), name, &metadata))
         }).collect::<Vec<_>>();
     entries.sort_by(|left, right| entry_kind_rank(&left.kind).cmp(&entry_kind_rank(&right.kind)).then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase())));
     Ok(entries)
@@ -1988,15 +2006,24 @@ struct TreeCancelled {
     request_id: String,
 }
 
+// Tree view refuses folders with more files than this (a somewhat arbitrary limit; see README).
+// Must match TREE_MAX_FILES in src/main.js.
+const TREE_MAX_FILES: u64 = 200_000;
+
+enum WalkStop {
+    Cancelled,
+    TooManyFiles,
+}
+
 fn walk_folder(
     path: &Path,
     cancel: &AtomicBool,
     scanned_files: &mut u64,
     scanned_folders: &mut u64,
     on_progress: &mut dyn FnMut(u64, u64),
-) -> Option<FolderNode> {
+) -> Result<FolderNode, WalkStop> {
     if cancel.load(Ordering::Relaxed) {
-        return None;
+        return Err(WalkStop::Cancelled);
     }
     let name = path
         .file_name()
@@ -2008,7 +2035,7 @@ fn walk_folder(
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.filter_map(Result::ok) {
             if cancel.load(Ordering::Relaxed) {
-                return None;
+                return Err(WalkStop::Cancelled);
             }
             let metadata = match entry.metadata() {
                 Ok(value) => value,
@@ -2025,12 +2052,15 @@ fn walk_folder(
                 file_count += 1;
                 total_size += metadata.len();
                 *scanned_files += 1;
+                if *scanned_files > TREE_MAX_FILES {
+                    return Err(WalkStop::TooManyFiles);
+                }
                 on_progress(*scanned_files, *scanned_folders);
             }
         }
     }
     children.sort_by(|left, right| right.total_size.cmp(&left.total_size));
-    Some(FolderNode { name, path: path.to_string_lossy().to_string(), file_count, total_size, children })
+    Ok(FolderNode { name, path: path.to_string_lossy().to_string(), file_count, total_size, children })
 }
 
 #[tauri::command]
@@ -2054,17 +2084,84 @@ fn compute_tree_stats(app: AppHandle, state: State<TreeState>, request_id: Strin
                     last_emit = Instant::now();
                 }
             });
+            if let Ok(mut cancels) = app.state::<TreeState>().cancels.lock() {
+                cancels.remove(&request_id);
+            }
             match result {
-                Some(tree) => {
+                Ok(tree) => {
                     let _ = app.emit("tree-done", TreeDone { request_id: request_id.clone(), tree });
                 }
-                None => {
+                Err(WalkStop::Cancelled) => {
                     let _ = app.emit("tree-cancelled", TreeCancelled { request_id: request_id.clone() });
+                }
+                Err(WalkStop::TooManyFiles) => {
+                    let _ = app.emit("tree-too-many", TreeCancelled { request_id: request_id.clone() });
                 }
             }
         })
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct FileNameScan {
+    // "done", "cancelled" or "too-many"
+    status: &'static str,
+    paths: Vec<String>,
+}
+
+// Lists every file under `path` for the search view. Shares the tree view's cancel flags (cancel it
+// with cancel_tree_stats) and its TREE_MAX_FILES limit. Progress goes out as "search-progress".
+#[tauri::command]
+async fn scan_file_names(app: AppHandle, request_id: String, path: String, show_hidden: bool) -> Result<FileNameScan, String> {
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    app.state::<TreeState>()
+        .cancels
+        .lock()
+        .map_err(|_| "tree state lock poisoned".to_string())?
+        .insert(request_id.clone(), cancel_flag.clone());
+    let worker_app = app.clone();
+    let worker_id = request_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut paths = Vec::new();
+        let mut scanned_folders = 0u64;
+        let mut last_emit = Instant::now();
+        let mut pending = vec![PathBuf::from(&path)];
+        while let Some(folder) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&folder) else { continue };
+            for entry in entries.filter_map(Result::ok) {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return FileNameScan { status: "cancelled", paths: Vec::new() };
+                }
+                let Ok(metadata) = entry.metadata() else { continue };
+                let entry_path = entry.path();
+                if !show_hidden && is_hidden(&entry_path, &entry.file_name().to_string_lossy()) {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    scanned_folders += 1;
+                    pending.push(entry_path);
+                } else {
+                    paths.push(entry_path.to_string_lossy().to_string());
+                    if paths.len() as u64 > TREE_MAX_FILES {
+                        return FileNameScan { status: "too-many", paths: Vec::new() };
+                    }
+                }
+                if last_emit.elapsed().as_millis() >= 100 {
+                    let _ = worker_app.emit("search-progress", TreeProgress { request_id: worker_id.clone(), scanned_files: paths.len() as u64, scanned_folders });
+                    last_emit = Instant::now();
+                }
+            }
+        }
+        paths.sort_by_cached_key(|value| value.to_lowercase());
+        FileNameScan { status: "done", paths }
+    })
+    .await
+    .map_err(|error| error.to_string());
+    if let Ok(mut cancels) = app.state::<TreeState>().cancels.lock() {
+        cancels.remove(&request_id);
+    }
+    result
 }
 
 #[tauri::command]
@@ -2469,7 +2566,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, scan_file_names, stat_entries, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }

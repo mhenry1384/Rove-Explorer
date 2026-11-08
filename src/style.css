@@ -83,3 +83,10 @@ html, body, #app { height: 100%; overflow: hidden; }
 .about-head { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
 .about-head strong { display: block; font-size: 16px; font-weight: 800; }
 .about-head .version-tag { display: inline-block; margin-top: 4px; }
+.search-bar { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.search-input { min-width: 0; flex: 1 1 auto; height: 32px; border: 1px solid var(--line); background: rgba(255,255,255,.7); padding: 0 12px; font: 11px 'DM Mono'; color: var(--ink); outline: none; -webkit-user-select: text; user-select: text; }
+.search-input:focus { border-color: #a9b168; box-shadow: 0 0 0 3px #e8f0c8; }
+.search-summary { flex: 0 0 auto; font: 10px 'DM Mono'; color: var(--muted); white-space: nowrap; }
+.search-wrap { grid-template-columns: minmax(150px, 1.3fr) minmax(80px, 1fr) repeat(2, max-content); }
+.search-folder { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-folder em { font-style: normal; color: #b3b5ad; }
