@@ -1,6 +1,6 @@
 [package]
 name = "rove-explorer"
-version = "0.4.24"
+version = "0.4.25"
 description = "A focused two-pane file explorer"
 authors = ["Rove Explorer"]
 edition = "2021"
@@ -19,6 +19,7 @@ tauri = { version = "2", features = ["protocol-asset", "image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-drag = "2"
+tauri-plugin-clipboard-manager = "2"
 notify = "6"
 trash = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

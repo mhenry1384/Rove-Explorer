@@ -14,6 +14,7 @@ A focused, dual-pane file explorer built with [Tauri](https://tauri.app) (Rust) 
 - Tree View and Search view refuse folders containing more than 200,000 files and say there are too many files; this is a somewhat arbitrary limit we picked to keep scans and memory use reasonable.
 - File type icons from the OS shell (Windows Explorer / Finder) with graceful fallback
 - Copy/cut/paste shares the system clipboard with Explorer and Finder
+- Right-click a file or folder and choose **Copy Full Path** to put its path on the clipboard as text (one path per line when several items are selected)
 - Breadcrumb path navigation and hidden-file toggle
 - On Windows, if [LockHunter](https://lockhunter.com) is installed, the right-click menu gets a **What is Locking this Folder?** (or **…this File?**) item, with LockHunter's icon, that opens LockHunter on that item to show which programs are holding it open. The app looks for LockHunter where its installer recorded it, then in `Program Files\LockHunter`; if it isn't found, the item doesn't appear.
 

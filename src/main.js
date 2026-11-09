@@ -6,6 +6,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import { LogicalPosition } from '@tauri-apps/api/dpi';
 import { ask, message } from '@tauri-apps/plugin-dialog';
+import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { Menu, MenuItem, IconMenuItem, Submenu, PredefinedMenuItem } from '@tauri-apps/api/menu';
 import { startDrag } from '@crabnebula/tauri-plugin-drag';
 import { version as APP_VERSION } from '../package.json';
@@ -533,6 +534,11 @@ function lockHunterMenuItem(menu) {
   return lockHunter.icon ? IconMenuItem.new({ text, icon: dataUriBytes(lockHunter.icon), action }) : MenuItem.new({ text, action });
 }
 
+// Puts the paths on the clipboard as plain text, one per line when several items are selected.
+function copyFullPaths(paths) {
+  writeText(paths.join('\n')).catch((error) => message(String(error), { title: 'Copy Full Path failed', kind: 'error' }));
+}
+
 function showProperties(menu) {
   const paths = propertiesPaths(menu);
   if (paths.length) invoke('show_properties', { paths }).catch((error) => console.error('show_properties failed', error));
@@ -551,18 +557,22 @@ async function showContextMenu(menu) {
     if (tab?.path && tab.view !== 'search') items.push(item('New Folder', () => createNewEntry(pane, 'create_folder')), item('New File', () => createNewEntry(pane, 'create_file')));
     items.push(item('Paste', () => pasteIntoPane(pane)));
   } else {
+    const paths = propertiesPaths(menu);
+    const copyFullPathItem = () => item('Copy Full Path', () => copyFullPaths(paths));
     if (kind === 'file') {
       const clicked = tab?.view === 'search' && tabEntries(tab).find((candidate) => candidate.id === menu.entryId);
       if (clicked) items.push(item('Open File Location', () => openFileLocation(pane, clicked)), separator());
       const single = singleSelectedFile(pane);
       if (single && (platformName === 'windows' || platformName === 'macos')) items.push(openWithSubmenu(single), separator());
       items.push(item('Copy', () => copySelected(pane)), item('Cut', () => cutSelected(pane)));
+      if (paths.length) items.push(copyFullPathItem());
       const entry = tabEntries(tab).find((candidate) => candidate.id === menu.entryId);
       if (entry && entry.kind !== 'drive') items.push(item('Rename', () => startRename(pane, entry)));
       if (canEditInTextEditor(pane)) items.push(item(textEditorLabel(), () => editSelectedInTextEditor(pane)));
       if (tab?.path) items.push(item('Compress', () => compressSelected(pane, menu.entryId)));
       items.push(separator());
     }
+    if (kind === 'tree') items.push(copyFullPathItem(), separator());
     items.push(item('Delete', () => (kind === 'tree' ? deleteTreeNode(pane, menu.path) : deleteSelected(pane))));
   }
   const lockHunterItem = lockHunterMenuItem(menu);

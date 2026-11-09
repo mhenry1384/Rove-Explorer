@@ -1,7 +1,7 @@
 {
   "name": "rove-explorer",
   "private": true,
-  "version": "0.4.24",
+  "version": "0.4.25",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -16,6 +16,7 @@
   "dependencies": {
     "@crabnebula/tauri-plugin-drag": "^2.1.0",
     "@tauri-apps/api": "^2.8.1",
+    "@tauri-apps/plugin-clipboard-manager": "~2.3.0",
     "@tauri-apps/plugin-dialog": "^2.4.0",
     "@tauri-apps/plugin-opener": "^2.5.0"
   }
