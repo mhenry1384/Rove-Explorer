@@ -1,5 +1,9 @@
 # Project Guidelines
 
+## Git
+
+- Commit and push all changes directly to `main`, not a feature branch, unless the user says otherwise.
+
 ## Release Builds
 
 - Before every release build, check `git status`. If there are uncommitted changes, bump the
