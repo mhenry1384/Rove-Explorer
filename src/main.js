@@ -769,13 +769,21 @@ document.addEventListener('click', (event) => {
   swallowClickAfterRename = false; event.preventDefault(); event.stopPropagation();
 }, true);
 
+// False if the Windows admin prompt is declined.
+async function renameWithElevation(path, newName) {
+  try { await invoke('rename_entry', { path, newName }); return true; } catch (error) {
+    if (!needsElevation(error)) throw error;
+    return invoke('rename_entry_elevated', { path, newName });
+  }
+}
+
 async function finishRename(index, entry, value) {
   if (!entry) { cancelRename(); return; }
   const newName = value.trim();
   if (!newName || newName === entry.name || INVALID_NAME_CHARS.test(newName)) { cancelRename(); return; }
   state.editing = null;
   try {
-    await invoke('rename_entry', { path: entry.path, newName });
+    if (!await renameWithElevation(entry.path, newName)) { render(); return; }
   } catch (error) {
     render();
     const kind = entry.kind === 'folder' ? 'folder' : 'file';
@@ -906,6 +914,19 @@ async function cutSelected(index) {
   render();
 }
 
+// Null if the Windows admin prompt is declined or the paste failed, which is reported here.
+async function pasteWithElevation(args) {
+  try {
+    try { return await invoke('paste_entries', args); } catch (error) {
+      if (!needsElevation(error)) throw error;
+      return await invoke('paste_entries_elevated', args);
+    }
+  } catch (error) {
+    await message(`Couldn't finish copying or moving.\n\n${error}`, { title: 'Paste failed', kind: 'error' });
+    return null;
+  }
+}
+
 async function pasteIntoPane(index) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.path) return;
@@ -919,7 +940,8 @@ async function pasteIntoPane(index) {
     const replaceAll = await ask(`${conflicts.length} ${noun} in the destination folder already exist. Replace them with the pasted version, or skip them and keep the existing ones?`, { title: 'Files already exist', okLabel: 'Replace All', cancelLabel: 'Skip' });
     conflictResolution = replaceAll ? 'replace' : 'skip';
   }
-  const pastedPaths = await invoke('paste_entries', { paths: payload.paths, destDir: tab.path, cut: payload.cut, conflictResolution });
+  const pastedPaths = await pasteWithElevation({ paths: payload.paths, destDir: tab.path, cut: payload.cut, conflictResolution });
+  if (!pastedPaths) return;
   if (payload.cut) state.clipboard = null;
   tab.entries = await load(tab.path);
   const pastedNames = new Set(pastedPaths.map((path) => path.split(/[\\/]/).pop()));
@@ -938,7 +960,7 @@ async function createNewEntry(index, command) {
     path = await invoke(command, { destDir: tab.path });
   } catch (error) {
     const text = String(error);
-    if (text.startsWith(NEEDS_ELEVATION)) showElevatedFolderDialog(index, tab, text.slice(NEEDS_ELEVATION.length));
+    if (needsElevation(text)) showElevatedCreateDialog(index, tab, text.slice(NEEDS_ELEVATION.length), command === 'create_folder');
     else await message(`Couldn't create it in this folder.\n\n${text}`, { title: 'Create failed', kind: 'error' });
     return;
   }
@@ -956,11 +978,13 @@ async function showCreatedEntry(index, tab, path) {
   return entry;
 }
 
-// create_folder's error when the folder needs administrator rights, followed by a suggested name.
+// The backend's error for anything that needs administrator rights. Creating adds a suggested name after it.
 const NEEDS_ELEVATION = 'needs-elevation:';
+function needsElevation(error) { return String(error).startsWith(NEEDS_ELEVATION); }
 
-function showElevatedFolderDialog(index, tab, suggestedName) {
-  showDialog('Administrator Permission Needed', `<p>You need administrator permission to create a folder in <strong>${escapeAttribute(tab.path)}</strong>. Windows will ask you to approve this.</p><p><label>Folder name<input class="dialog-text-input" data-elevated-name spellcheck="false" value="${escapeAttribute(suggestedName)}"></label></p><p class="folders-editor-error" data-elevated-error></p><div class="dialog-actions"><span></span><button data-dialog-cancel>Cancel</button><button class="primary" data-elevated-create>Create</button></div>`);
+function showElevatedCreateDialog(index, tab, suggestedName, isFolder) {
+  const noun = isFolder ? 'folder' : 'file';
+  showDialog('Administrator Permission Needed', `<p>You need administrator permission to create a ${noun} in <strong>${escapeAttribute(tab.path)}</strong>. Windows will ask you to approve this.</p><p><label>${isFolder ? 'Folder' : 'File'} name<input class="dialog-text-input" data-elevated-name spellcheck="false" value="${escapeAttribute(suggestedName)}"></label></p><p class="folders-editor-error" data-elevated-error></p><div class="dialog-actions"><span></span><button data-dialog-cancel>Cancel</button><button class="primary" data-elevated-create>Create</button></div>`);
   const input = dialogRoot.querySelector('[data-elevated-name]');
   const errorLine = dialogRoot.querySelector('[data-elevated-error]');
   const create = dialogRoot.querySelector('[data-elevated-create]');
@@ -968,11 +992,11 @@ function showElevatedFolderDialog(index, tab, suggestedName) {
   input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); create.click(); } });
   create.addEventListener('click', async () => {
     const name = input.value.trim();
-    if (!name || INVALID_NAME_CHARS.test(name)) { errorLine.textContent = "That name can't be used for a folder."; input.focus(); return; }
+    if (!name || INVALID_NAME_CHARS.test(name)) { errorLine.textContent = `That name can't be used for a ${noun}.`; input.focus(); return; }
     create.disabled = true;
     errorLine.textContent = '';
     try {
-      const path = await invoke('create_folder_elevated', { destDir: tab.path, name });
+      const path = await invoke('create_entry_elevated', { destDir: tab.path, name, isFolder });
       closeDialog();
       if (path) { await showCreatedEntry(index, tab, path); render(); }
     } catch (error) {
@@ -982,7 +1006,8 @@ function showElevatedFolderDialog(index, tab, suggestedName) {
     }
   });
   input.focus();
-  input.select();
+  const extension = isFolder ? -1 : suggestedName.lastIndexOf('.');
+  input.setSelectionRange(0, extension > 0 ? extension : suggestedName.length);
 }
 
 async function editSelectedInTextEditor(index) {
@@ -1077,7 +1102,8 @@ async function transferIntoPane(paneIndex, destDir, paths, { cut, verb }) {
     const replaceAll = await ask(`${conflicts.length} ${noun} in the destination folder already exist. Replace them with the version being ${verb}, or skip them and keep the existing ones?`, { title: 'Files already exist', okLabel: 'Replace All', cancelLabel: 'Skip' });
     conflictResolution = replaceAll ? 'replace' : 'skip';
   }
-  const droppedPaths = await invoke('paste_entries', { paths, destDir, cut, conflictResolution });
+  const droppedPaths = await pasteWithElevation({ paths, destDir, cut, conflictResolution });
+  if (!droppedPaths) return;
   if (normalizePath(tab.path) === normalizePath(destDir)) {
     tab.entries = await load(tab.path);
     const droppedNames = new Set(droppedPaths.map((path) => path.split(/[\\/]/).pop()));

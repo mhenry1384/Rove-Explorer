@@ -245,19 +245,28 @@ fn is_valid_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(INVALID_NAME_CHARS)
 }
 
-#[tauri::command]
-fn rename_entry(path: String, new_name: String) -> Result<(), String> {
-    if !is_valid_name(&new_name) {
+// Where a rename would put `path`, refusing bad names and anything that would overwrite another item.
+fn rename_target(source: &Path, new_name: &str) -> Result<PathBuf, String> {
+    if !is_valid_name(new_name) {
         return Err("Invalid folder name".to_string());
     }
-    let source = Path::new(&path);
-    let target = source.parent().ok_or_else(|| "Invalid folder path".to_string())?.join(&new_name);
+    let target = source.parent().ok_or_else(|| "Invalid folder path".to_string())?.join(new_name);
     // fs::rename silently replaces an existing file, so refuse instead. On a case-insensitive drive a
     // case-only rename ("photo" -> "Photo") also "exists", but both paths resolve to the same item.
     if target.exists() && fs::canonicalize(source).ok() != fs::canonicalize(&target).ok() {
         return Err(format!("An item named \"{new_name}\" already exists in this folder."));
     }
-    fs::rename(source, &target).map_err(|error| readable_rename_error(&error, source.is_dir()))
+    Ok(target)
+}
+
+#[tauri::command]
+fn rename_entry(path: String, new_name: String) -> Result<(), String> {
+    let source = Path::new(&path);
+    let target = rename_target(source, &new_name)?;
+    fs::rename(source, &target).map_err(|error| {
+        // A folder that's in use also reports access denied, so check whether permissions are really the cause.
+        if error.raw_os_error() == Some(5) && access_denied(source, DELETE) { NEEDS_ELEVATION.to_string() } else { readable_rename_error(&error, source.is_dir()) }
+    })
 }
 
 // Windows reports a locked file as a sharing violation (32) or lock violation (33). A folder that
@@ -469,59 +478,154 @@ fn unused_name(dir: &Path, stem: &str, extension: &str) -> PathBuf {
 #[tauri::command]
 fn create_file(dest_dir: String) -> Result<String, String> {
     let candidate = unused_name(Path::new(&dest_dir), "New File", ".txt");
-    fs::File::create(&candidate).map_err(|error| error.to_string())?;
+    fs::File::create(&candidate).map_err(|error| create_error(&candidate, error))?;
     Ok(candidate.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 fn create_folder(dest_dir: String) -> Result<String, String> {
     let candidate = unused_name(Path::new(&dest_dir), "New Folder", "");
-    fs::create_dir(&candidate).map_err(|error| {
-        // Access denied is only recoverable on Windows, where the frontend can offer a UAC prompt.
-        if cfg!(windows) && error.raw_os_error() == Some(5) {
-            format!("{NEEDS_ELEVATION}{}", candidate.file_name().unwrap_or_default().to_string_lossy())
-        } else {
-            error.to_string()
-        }
-    })?;
+    fs::create_dir(&candidate).map_err(|error| create_error(&candidate, error))?;
     Ok(candidate.to_string_lossy().to_string())
 }
 
-// create_folder's error when the folder needs administrator rights, followed by a suggested unused name.
+// Access denied is only recoverable on Windows, where the frontend can offer a UAC prompt.
+fn create_error(candidate: &Path, error: std::io::Error) -> String {
+    if cfg!(windows) && error.raw_os_error() == Some(5) {
+        format!("{NEEDS_ELEVATION}{}", candidate.file_name().unwrap_or_default().to_string_lossy())
+    } else {
+        error.to_string()
+    }
+}
+
+// The error from an operation that needs administrator rights. Creating adds a suggested unused name.
 const NEEDS_ELEVATION: &str = "needs-elevation:";
 
-// The name is chosen before elevating because the new folder belongs to the administrators, so
+const FILE_ADD_FILE: u32 = 0x2;
+const FILE_ADD_SUBDIRECTORY: u32 = 0x4;
+const DELETE: u32 = 0x1_0000;
+
+// Whether Windows refuses this kind of access to a file or folder. It only asks for the access,
+// so nothing on disk changes. Anything other than access denied (e.g. a sharing violation) is false.
+#[cfg(windows)]
+fn access_denied(path: &Path, access: u32) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000; // required to open a folder
+    fs::OpenOptions::new().access_mode(access).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).err().and_then(|error| error.raw_os_error()) == Some(5)
+}
+
+#[cfg(not(windows))]
+fn access_denied(_path: &Path, _access: u32) -> bool {
+    false
+}
+
+// The name is chosen before elevating because the new item belongs to the administrators, so
 // renaming it afterwards would need a second UAC prompt. Returns None if the UAC prompt is declined.
-// Runs off the main thread (async) so the window keeps painting while Windows waits for an answer.
+// The elevated commands run off the main thread (async) so the window keeps painting during the wait.
 #[tauri::command(async)]
-fn create_folder_elevated(window: tauri::WebviewWindow, dest_dir: String, name: String) -> Result<Option<String>, String> {
-    if !is_valid_name(&name) { return Err("That name can't be used for a folder.".to_string()); }
+fn create_entry_elevated(window: tauri::WebviewWindow, dest_dir: String, name: String, is_folder: bool) -> Result<Option<String>, String> {
+    if !is_valid_name(&name) { return Err("That name can't be used here.".to_string()); }
     let target = Path::new(&dest_dir).join(&name);
     if target.exists() { return Err(format!("An item named \"{name}\" already exists in this folder.")); }
     let target = target.to_string_lossy().into_owned();
+    let flag = if is_folder { ELEVATED_CREATE_FOLDER } else { ELEVATED_CREATE_FILE };
+    Ok(run_elevated(&window, flag, &[&target])?.then_some(target))
+}
+
+// False if the UAC prompt is declined.
+#[tauri::command(async)]
+fn rename_entry_elevated(window: tauri::WebviewWindow, path: String, new_name: String) -> Result<bool, String> {
+    let target = rename_target(Path::new(&path), &new_name)?;
+    run_elevated(&window, ELEVATED_RENAME, &[&path, &target.to_string_lossy()])
+}
+
+// A paste can list more paths than fit on a command line, so the elevated copy reads them from a file.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Serialize, Deserialize)]
+struct PasteJob {
+    paths: Vec<String>,
+    dest_dir: String,
+    cut: bool,
+    conflict_resolution: Option<String>,
+}
+
+// The job decides what runs as administrator, so the returned handle stays open until the elevated
+// copy has finished: it lets others read the file but stops them changing or replacing it.
+#[cfg(windows)]
+fn create_paste_job_file(job: &PasteJob) -> std::io::Result<(fs::File, PathBuf)> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 1;
+    let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let path = std::env::temp_dir().join(format!("rove-paste-{}-{unique}.json", std::process::id()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).share_mode(FILE_SHARE_READ).open(&path)?;
+    file.write_all(&serde_json::to_vec(job)?)?;
+    Ok((file, path))
+}
+
+#[cfg(windows)]
+fn run_paste_job(job_path: &Path) -> std::io::Result<()> {
+    let job: PasteJob = serde_json::from_str(&fs::read_to_string(job_path)?)?;
+    paste_items(&job.paths, Path::new(&job.dest_dir), job.cut, job.conflict_resolution.as_deref()).map(|_| ())
+}
+
+// Returns what's new in the destination, or None if the UAC prompt is declined. The elevated copy
+// can't safely report back: as administrator it shouldn't write to a place a normal program controls.
+#[tauri::command(async)]
+fn paste_entries_elevated(window: tauri::WebviewWindow, paths: Vec<String>, dest_dir: String, cut: bool, conflict_resolution: Option<String>) -> Result<Option<Vec<String>>, String> {
     #[cfg(windows)]
     {
-        let owner = window.hwnd().map(|handle| handle.0 as isize).unwrap_or(0);
-        Ok(win_shell::create_folder_elevated(&target, owner)?.then_some(target))
+        let names = || -> std::collections::HashSet<std::ffi::OsString> { fs::read_dir(&dest_dir).into_iter().flatten().flatten().map(|entry| entry.file_name()).collect() };
+        let before = names();
+        let (job_file, job_path) = create_paste_job_file(&PasteJob { paths, dest_dir: dest_dir.clone(), cut, conflict_resolution }).map_err(|error| error.to_string())?;
+        let finished = run_elevated(&window, ELEVATED_PASTE, &[&job_path.to_string_lossy()]);
+        drop(job_file);
+        let _ = fs::remove_file(&job_path);
+        if !finished? { return Ok(None); }
+        Ok(Some(names().difference(&before).map(|name| Path::new(&dest_dir).join(name).to_string_lossy().into_owned()).collect()))
     }
     #[cfg(not(windows))]
     {
-        let _ = (window, target);
-        Err("Creating folders as administrator is only supported on Windows.".to_string())
+        let _ = (window, paths, dest_dir, cut, conflict_resolution);
+        Err("Pasting as administrator is only supported on Windows.".to_string())
     }
 }
 
 #[cfg(windows)]
-const ELEVATED_CREATE_FOLDER_ARG: &str = "--elevated-create-folder";
+fn run_elevated(window: &tauri::WebviewWindow, flag: &str, paths: &[&str]) -> Result<bool, String> {
+    let owner = window.hwnd().map(|handle| handle.0 as isize).unwrap_or(0);
+    win_shell::run_self_elevated(flag, paths, owner)
+}
 
-// The exit code when this process is the copy of the app that UAC launched to create a folder, which
-// does that one job and exits without opening a window. None for a normal launch.
+#[cfg(not(windows))]
+fn run_elevated(_window: &tauri::WebviewWindow, _flag: &str, _paths: &[&str]) -> Result<bool, String> {
+    Err("Administrator access is only supported on Windows.".to_string())
+}
+
+// The arguments that make this program do one privileged job (see elevated_helper_exit_code).
+const ELEVATED_CREATE_FOLDER: &str = "--elevated-create-folder";
+const ELEVATED_CREATE_FILE: &str = "--elevated-create-file";
+const ELEVATED_RENAME: &str = "--elevated-rename";
+#[cfg(windows)]
+const ELEVATED_PASTE: &str = "--elevated-paste";
+
+// The exit code when this process is the copy of the app that UAC launched for one privileged job,
+// which it does before exiting without opening a window. None for a normal launch.
 #[cfg(windows)]
 fn elevated_helper_exit_code(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<i32> {
     const ERROR_INVALID_PARAMETER: i32 = 87;
-    if args.next()? != ELEVATED_CREATE_FOLDER_ARG { return None; }
-    let Some(path) = args.next() else { return Some(ERROR_INVALID_PARAMETER) };
-    Some(match fs::create_dir(path) { Ok(()) => 0, Err(error) => error.raw_os_error().unwrap_or(1) })
+    let flag = args.next()?;
+    let flag = flag.to_str()?;
+    let paths: Vec<std::ffi::OsString> = args.collect();
+    let result = match (flag, paths.as_slice()) {
+        (ELEVATED_CREATE_FOLDER, [path]) => fs::create_dir(path),
+        (ELEVATED_CREATE_FILE, [path]) => fs::File::create_new(path).map(|_| ()),
+        (ELEVATED_RENAME, [from, to]) => fs::rename(from, to),
+        (ELEVATED_PASTE, [job]) => run_paste_job(Path::new(job)),
+        (ELEVATED_CREATE_FOLDER | ELEVATED_CREATE_FILE | ELEVATED_RENAME | ELEVATED_PASTE, _) => return Some(ERROR_INVALID_PARAMETER),
+        _ => return None,
+    };
+    Some(match result { Ok(()) => 0, Err(error) => error.raw_os_error().unwrap_or(1) })
 }
 
 #[tauri::command]
@@ -1017,16 +1121,17 @@ mod win_shell {
         Ok(())
     }
 
-    // Relaunches this program elevated to create the folder at `path`, waiting for it to finish.
+    // Relaunches this program elevated to do one job, waiting for it to finish.
     // Ok(false) means the user declined the UAC prompt.
-    pub fn create_folder_elevated(path: &str, owner_window: isize) -> Result<bool, String> {
+    pub fn run_self_elevated(flag: &str, paths: &[&str], owner_window: isize) -> Result<bool, String> {
         const ERROR_CANCELLED: i32 = 1223;
         unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         let verb = wide("runas");
         let file = wide(&exe.to_string_lossy());
-        // Windows names can't contain a quote, and `path` always ends in the folder's name rather than a backslash.
-        let parameters = wide(&format!("{} \"{path}\"", super::ELEVATED_CREATE_FOLDER_ARG));
+        // Windows names can't contain a quote, and these paths all end in a name rather than a backslash.
+        let quoted: Vec<String> = paths.iter().map(|path| format!("\"{path}\"")).collect();
+        let parameters = wide(&format!("{flag} {}", quoted.join(" ")));
         let mut info = ShellExecuteInfoW {
             cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
             f_mask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
@@ -1641,17 +1746,31 @@ fn is_same_or_inside(path: &Path, ancestor: &Path) -> bool {
     }
 }
 
+// Checked before starting so a paste doesn't get partway and then have to be redone as administrator.
+fn paste_needs_elevation(paths: &[String], dest: &Path, cut: bool) -> bool {
+    paths.iter().map(Path::new).any(|source| {
+        if (cut && source.parent() == Some(dest)) || is_same_or_inside(dest, source) { return false; }
+        let add = if source.is_dir() { FILE_ADD_SUBDIRECTORY } else { FILE_ADD_FILE };
+        access_denied(dest, add) || (cut && access_denied(source, DELETE))
+    })
+}
+
 #[tauri::command]
 fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool, conflict_resolution: Option<String>) -> Result<Vec<String>, String> {
-    let resolution = if conflict_resolution.as_deref() == Some("replace") { ConflictResolution::Replace } else { ConflictResolution::Skip };
     let dest = Path::new(&dest_dir);
+    if paste_needs_elevation(&paths, dest, cut) { return Err(NEEDS_ELEVATION.to_string()); }
+    paste_items(&paths, dest, cut, conflict_resolution.as_deref()).map_err(|error| error.to_string())
+}
+
+fn paste_items(paths: &[String], dest: &Path, cut: bool, conflict_resolution: Option<&str>) -> std::io::Result<Vec<String>> {
+    let resolution = if conflict_resolution == Some("replace") { ConflictResolution::Replace } else { ConflictResolution::Skip };
     let mut results = Vec::with_capacity(paths.len());
     for source_path in paths {
-        let source = Path::new(&source_path);
+        let source = Path::new(source_path);
         let Some(name) = source.file_name().map(|value| value.to_string_lossy().to_string()) else { continue };
         if cut && source.parent() == Some(dest) {
             // Cutting and pasting back into the same folder is a no-op, like Explorer.
-            results.push(source_path);
+            results.push(source_path.clone());
             continue;
         }
         if is_same_or_inside(dest, source) {
@@ -1661,7 +1780,7 @@ fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool, conflict_resol
         let existing_target = dest.join(&name);
         if source.is_dir() && existing_target.is_dir() {
             // A same-named folder already lives here: merge into it instead of renaming a copy alongside it.
-            merge_dir_recursive(source, &existing_target, cut, resolution).map_err(|error| error.to_string())?;
+            merge_dir_recursive(source, &existing_target, cut, resolution)?;
             if cut {
                 let _ = fs::remove_dir(source);
             }
@@ -1672,17 +1791,17 @@ fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool, conflict_resol
         if cut {
             if fs::rename(source, &target).is_err() {
                 if source.is_dir() {
-                    copy_dir_recursive(source, &target).map_err(|error| error.to_string())?;
-                    fs::remove_dir_all(source).map_err(|error| error.to_string())?;
+                    copy_dir_recursive(source, &target)?;
+                    fs::remove_dir_all(source)?;
                 } else {
-                    fs::copy(source, &target).map_err(|error| error.to_string())?;
-                    fs::remove_file(source).map_err(|error| error.to_string())?;
+                    fs::copy(source, &target)?;
+                    fs::remove_file(source)?;
                 }
             }
         } else if source.is_dir() {
-            copy_dir_recursive(source, &target).map_err(|error| error.to_string())?;
+            copy_dir_recursive(source, &target)?;
         } else {
-            fs::copy(source, &target).map_err(|error| error.to_string())?;
+            fs::copy(source, &target)?;
         }
         results.push(target.to_string_lossy().to_string());
     }
@@ -1857,17 +1976,86 @@ mod paste_entries_tests {
     }
 
     #[cfg(windows)]
+    fn helper(flag: &str, paths: &[&Path]) -> Option<i32> {
+        let args = std::iter::once(std::ffi::OsString::from(flag)).chain(paths.iter().map(|path| path.as_os_str().to_owned()));
+        elevated_helper_exit_code(args.collect::<Vec<_>>().into_iter())
+    }
+
+    #[cfg(windows)]
     #[test]
-    fn elevated_helper_creates_only_the_requested_folder() {
+    fn elevated_helper_does_only_the_requested_job() {
         let sandbox = Sandbox::new("elevated-helper");
         let folder = sandbox.path("Name with % & (x86)");
-        let args = |path: &Path| vec![std::ffi::OsString::from(ELEVATED_CREATE_FOLDER_ARG), path.as_os_str().to_owned()].into_iter();
-        assert_eq!(elevated_helper_exit_code(args(&folder)), Some(0));
+        assert_eq!(helper(ELEVATED_CREATE_FOLDER, &[&folder]), Some(0));
         assert!(folder.is_dir());
-        assert_eq!(elevated_helper_exit_code(args(&folder)), Some(183), "already exists");
+        assert_eq!(helper(ELEVATED_CREATE_FOLDER, &[&folder]), Some(183), "already exists");
+        let file = folder.join("note.txt");
+        assert_eq!(helper(ELEVATED_CREATE_FILE, &[&file]), Some(0));
+        assert!(file.is_file());
+        assert_eq!(helper(ELEVATED_CREATE_FILE, &[&file]), Some(80), "already exists, and isn't truncated");
+        let renamed = folder.join("renamed.txt");
+        assert_eq!(helper(ELEVATED_RENAME, &[&file, &renamed]), Some(0));
+        assert!(renamed.is_file() && !file.exists());
         assert_eq!(elevated_helper_exit_code(std::iter::empty()), None, "normal launch");
-        assert_eq!(elevated_helper_exit_code(vec![std::ffi::OsString::from("C:\\some\\file")].into_iter()), None, "opened with another argument");
-        assert_eq!(elevated_helper_exit_code(vec![std::ffi::OsString::from(ELEVATED_CREATE_FOLDER_ARG)].into_iter()), Some(87), "no path");
+        assert_eq!(helper("C:\\some\\file", &[]), None, "opened with another argument");
+        assert_eq!(helper(ELEVATED_CREATE_FOLDER, &[]), Some(87), "no path");
+        assert_eq!(helper(ELEVATED_RENAME, &[&file]), Some(87), "no target");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_paste_reads_the_job_while_it_stays_locked() {
+        let sandbox = Sandbox::new("elevated-paste");
+        fs::write(sandbox.path("a.txt"), "hello").unwrap();
+        fs::create_dir_all(sandbox.path("dest")).unwrap();
+        let job = PasteJob { paths: vec![sandbox.path("a.txt").to_string_lossy().to_string()], dest_dir: sandbox.path("dest").to_string_lossy().to_string(), cut: true, conflict_resolution: None };
+        let (file, job_path) = create_paste_job_file(&job).unwrap();
+        assert!(fs::OpenOptions::new().write(true).open(&job_path).is_err(), "others can't change the job");
+        assert_eq!(helper(ELEVATED_PASTE, &[&job_path]), Some(0));
+        drop(file);
+        fs::remove_file(&job_path).unwrap();
+        assert_eq!(fs::read_to_string(sandbox.path("dest/a.txt")).unwrap(), "hello");
+        assert!(!sandbox.path("a.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn denied_operations_ask_for_elevation() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const EVERYONE: &str = "*S-1-1-0";
+        let icacls = |path: &Path, args: &[&str]| { assert!(std::process::Command::new("icacls").arg(path).args(args).creation_flags(CREATE_NO_WINDOW).output().unwrap().status.success()); };
+        let sandbox = Sandbox::new("denied-elevation");
+        let locked = sandbox.path("locked");
+        fs::create_dir_all(&locked).unwrap();
+        let held = locked.join("held.txt");
+        fs::write(&held, "x").unwrap();
+        fs::write(sandbox.path("a.txt"), "x").unwrap();
+        fs::create_dir_all(sandbox.path("open")).unwrap();
+        let source = sandbox.path("a.txt").to_string_lossy().to_string();
+        let open = sandbox.path("open").to_string_lossy().to_string();
+        let locked_text = locked.to_string_lossy().to_string();
+        let held_text = held.to_string_lossy().to_string();
+
+        icacls(&held, &["/deny", &format!("{EVERYONE}:(DE)")]);
+        icacls(&locked, &["/deny", &format!("{EVERYONE}:(WD,AD,DC)")]);
+        let folder = create_folder(locked_text.clone());
+        let file = create_file(locked_text.clone());
+        let rename = rename_entry(held_text.clone(), "other.txt".to_string());
+        let paste_in = paste_entries(vec![source.clone()], locked_text.clone(), false, None);
+        let move_out = paste_entries(vec![held_text.clone()], open.clone(), true, None);
+        let moved_copy_left = sandbox.path("open/held.txt").exists();
+        let copy_out = paste_entries(vec![held_text.clone()], open.clone(), false, None);
+        icacls(&locked, &["/remove:d", EVERYONE]);
+        icacls(&held, &["/remove:d", EVERYONE]);
+
+        assert_eq!(folder.unwrap_err(), format!("{NEEDS_ELEVATION}New Folder"));
+        assert_eq!(file.unwrap_err(), format!("{NEEDS_ELEVATION}New File.txt"));
+        assert_eq!(rename.unwrap_err(), NEEDS_ELEVATION);
+        assert_eq!(paste_in.unwrap_err(), NEEDS_ELEVATION);
+        assert_eq!(move_out.unwrap_err(), NEEDS_ELEVATION);
+        assert!(!moved_copy_left, "a refused move leaves no copy behind");
+        assert_eq!(copy_out.unwrap().len(), 1, "copying out only needs read access");
     }
 
     #[test]
@@ -2681,7 +2869,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, create_folder_elevated, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, scan_file_names, stat_entries, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, create_entry_elevated, rename_entry_elevated, paste_entries_elevated, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, scan_file_names, stat_entries, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }
