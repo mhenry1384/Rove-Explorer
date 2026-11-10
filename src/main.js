@@ -933,14 +933,56 @@ async function pasteIntoPane(index) {
 async function createNewEntry(index, command) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.path) { render(); return; }
-  const path = await invoke(command, { destDir: tab.path });
+  let path;
+  try {
+    path = await invoke(command, { destDir: tab.path });
+  } catch (error) {
+    const text = String(error);
+    if (text.startsWith(NEEDS_ELEVATION)) showElevatedFolderDialog(index, tab, text.slice(NEEDS_ELEVATION.length));
+    else await message(`Couldn't create it in this folder.\n\n${text}`, { title: 'Create failed', kind: 'error' });
+    return;
+  }
+  const entry = await showCreatedEntry(index, tab, path);
+  if (entry) startRename(index, entry);
+}
+
+async function showCreatedEntry(index, tab, path) {
   tab.entries = await load(tab.path);
   const entry = tab.entries.find((item) => item.path === path);
-  if (!entry) { render(); return; }
+  if (!entry) { render(); return null; }
   selectSingle(tab, entry.id);
   saveSession();
   scrollSelectionIntoView = true;
-  startRename(index, entry);
+  return entry;
+}
+
+// create_folder's error when the folder needs administrator rights, followed by a suggested name.
+const NEEDS_ELEVATION = 'needs-elevation:';
+
+function showElevatedFolderDialog(index, tab, suggestedName) {
+  showDialog('Administrator Permission Needed', `<p>You need administrator permission to create a folder in <strong>${escapeAttribute(tab.path)}</strong>. Windows will ask you to approve this.</p><p><label>Folder name<input class="dialog-text-input" data-elevated-name spellcheck="false" value="${escapeAttribute(suggestedName)}"></label></p><p class="folders-editor-error" data-elevated-error></p><div class="dialog-actions"><span></span><button data-dialog-cancel>Cancel</button><button class="primary" data-elevated-create>Create</button></div>`);
+  const input = dialogRoot.querySelector('[data-elevated-name]');
+  const errorLine = dialogRoot.querySelector('[data-elevated-error]');
+  const create = dialogRoot.querySelector('[data-elevated-create]');
+  dialogRoot.querySelector('[data-dialog-cancel]').addEventListener('click', closeDialog);
+  input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); create.click(); } });
+  create.addEventListener('click', async () => {
+    const name = input.value.trim();
+    if (!name || INVALID_NAME_CHARS.test(name)) { errorLine.textContent = "That name can't be used for a folder."; input.focus(); return; }
+    create.disabled = true;
+    errorLine.textContent = '';
+    try {
+      const path = await invoke('create_folder_elevated', { destDir: tab.path, name });
+      closeDialog();
+      if (path) { await showCreatedEntry(index, tab, path); render(); }
+    } catch (error) {
+      errorLine.textContent = String(error);
+      create.disabled = false;
+      input.focus();
+    }
+  });
+  input.focus();
+  input.select();
 }
 
 async function editSelectedInTextEditor(index) {

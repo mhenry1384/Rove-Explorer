@@ -241,9 +241,13 @@ const INVALID_NAME_CHARS: &[char] = &['/', ':'];
 #[cfg(not(any(windows, target_os = "macos")))]
 const INVALID_NAME_CHARS: &[char] = &['/'];
 
+fn is_valid_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(INVALID_NAME_CHARS)
+}
+
 #[tauri::command]
 fn rename_entry(path: String, new_name: String) -> Result<(), String> {
-    if new_name.is_empty() || new_name == "." || new_name == ".." || new_name.contains(INVALID_NAME_CHARS) {
+    if !is_valid_name(&new_name) {
         return Err("Invalid folder name".to_string());
     }
     let source = Path::new(&path);
@@ -472,8 +476,52 @@ fn create_file(dest_dir: String) -> Result<String, String> {
 #[tauri::command]
 fn create_folder(dest_dir: String) -> Result<String, String> {
     let candidate = unused_name(Path::new(&dest_dir), "New Folder", "");
-    fs::create_dir(&candidate).map_err(|error| error.to_string())?;
+    fs::create_dir(&candidate).map_err(|error| {
+        // Access denied is only recoverable on Windows, where the frontend can offer a UAC prompt.
+        if cfg!(windows) && error.raw_os_error() == Some(5) {
+            format!("{NEEDS_ELEVATION}{}", candidate.file_name().unwrap_or_default().to_string_lossy())
+        } else {
+            error.to_string()
+        }
+    })?;
     Ok(candidate.to_string_lossy().to_string())
+}
+
+// create_folder's error when the folder needs administrator rights, followed by a suggested unused name.
+const NEEDS_ELEVATION: &str = "needs-elevation:";
+
+// The name is chosen before elevating because the new folder belongs to the administrators, so
+// renaming it afterwards would need a second UAC prompt. Returns None if the UAC prompt is declined.
+// Runs off the main thread (async) so the window keeps painting while Windows waits for an answer.
+#[tauri::command(async)]
+fn create_folder_elevated(window: tauri::WebviewWindow, dest_dir: String, name: String) -> Result<Option<String>, String> {
+    if !is_valid_name(&name) { return Err("That name can't be used for a folder.".to_string()); }
+    let target = Path::new(&dest_dir).join(&name);
+    if target.exists() { return Err(format!("An item named \"{name}\" already exists in this folder.")); }
+    let target = target.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        let owner = window.hwnd().map(|handle| handle.0 as isize).unwrap_or(0);
+        Ok(win_shell::create_folder_elevated(&target, owner)?.then_some(target))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, target);
+        Err("Creating folders as administrator is only supported on Windows.".to_string())
+    }
+}
+
+#[cfg(windows)]
+const ELEVATED_CREATE_FOLDER_ARG: &str = "--elevated-create-folder";
+
+// The exit code when this process is the copy of the app that UAC launched to create a folder, which
+// does that one job and exits without opening a window. None for a normal launch.
+#[cfg(windows)]
+fn elevated_helper_exit_code(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<i32> {
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    if args.next()? != ELEVATED_CREATE_FOLDER_ARG { return None; }
+    let Some(path) = args.next() else { return Some(ERROR_INVALID_PARAMETER) };
+    Some(match fs::create_dir(path) { Ok(()) => 0, Err(error) => error.raw_os_error().unwrap_or(1) })
 }
 
 #[tauri::command]
@@ -877,6 +925,9 @@ mod win_shell {
     use std::os::windows::ffi::OsStrExt;
 
     const SEE_MASK_INVOKEIDLIST: u32 = 0x0000_000C;
+    const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+    const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
+    const INFINITE: u32 = 0xFFFF_FFFF;
     const SW_SHOW: i32 = 5;
     const ASSOC_FILTER_RECOMMENDED: u32 = 0x1;
     const COINIT_APARTMENTTHREADED: u32 = 0x2;
@@ -923,6 +974,9 @@ mod win_shell {
     }
     extern "system" {
         fn DestroyIcon(icon: isize) -> i32;
+        fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
+        fn GetExitCodeProcess(process: isize, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
     }
 
     fn wide(value: &str) -> Vec<u16> {
@@ -961,6 +1015,50 @@ mod win_shell {
             return Err(std::io::Error::last_os_error().to_string());
         }
         Ok(())
+    }
+
+    // Relaunches this program elevated to create the folder at `path`, waiting for it to finish.
+    // Ok(false) means the user declined the UAC prompt.
+    pub fn create_folder_elevated(path: &str, owner_window: isize) -> Result<bool, String> {
+        const ERROR_CANCELLED: i32 = 1223;
+        unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        let verb = wide("runas");
+        let file = wide(&exe.to_string_lossy());
+        // Windows names can't contain a quote, and `path` always ends in the folder's name rather than a backslash.
+        let parameters = wide(&format!("{} \"{path}\"", super::ELEVATED_CREATE_FOLDER_ARG));
+        let mut info = ShellExecuteInfoW {
+            cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+            f_mask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            hwnd: owner_window,
+            lp_verb: verb.as_ptr(),
+            lp_file: file.as_ptr(),
+            lp_parameters: parameters.as_ptr(),
+            lp_directory: std::ptr::null(),
+            n_show: SW_SHOW,
+            h_inst_app: 0,
+            lp_id_list: std::ptr::null_mut(),
+            lp_class: std::ptr::null(),
+            hkey_class: 0,
+            dw_hot_key: 0,
+            h_icon_or_monitor: 0,
+            h_process: 0,
+        };
+        if unsafe { ShellExecuteExW(&mut info) } == 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_CANCELLED) { Ok(false) } else { Err(error.to_string()) };
+        }
+        if info.h_process == 0 { return Err("Windows didn't start the administrator process.".to_string()); }
+        let mut exit_code = 1u32;
+        let read_exit_code = unsafe {
+            WaitForSingleObject(info.h_process, INFINITE);
+            let read = GetExitCodeProcess(info.h_process, &mut exit_code);
+            CloseHandle(info.h_process);
+            read
+        };
+        if read_exit_code == 0 { return Err(std::io::Error::last_os_error().to_string()); }
+        if exit_code != 0 { return Err(std::io::Error::from_raw_os_error(exit_code as i32).to_string()); }
+        Ok(true)
     }
 
     fn show_multiple(paths: &[String]) -> Result<(), String> {
@@ -1756,6 +1854,20 @@ mod paste_entries_tests {
         assert!(Path::new(&path).is_dir());
         let path = create_folder(sandbox.dir.to_string_lossy().to_string()).unwrap();
         assert_eq!(path, sandbox.path("New Folder 2").to_string_lossy().to_string());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_helper_creates_only_the_requested_folder() {
+        let sandbox = Sandbox::new("elevated-helper");
+        let folder = sandbox.path("Name with % & (x86)");
+        let args = |path: &Path| vec![std::ffi::OsString::from(ELEVATED_CREATE_FOLDER_ARG), path.as_os_str().to_owned()].into_iter();
+        assert_eq!(elevated_helper_exit_code(args(&folder)), Some(0));
+        assert!(folder.is_dir());
+        assert_eq!(elevated_helper_exit_code(args(&folder)), Some(183), "already exists");
+        assert_eq!(elevated_helper_exit_code(std::iter::empty()), None, "normal launch");
+        assert_eq!(elevated_helper_exit_code(vec![std::ffi::OsString::from("C:\\some\\file")].into_iter()), None, "opened with another argument");
+        assert_eq!(elevated_helper_exit_code(vec![std::ffi::OsString::from(ELEVATED_CREATE_FOLDER_ARG)].into_iter()), Some(87), "no path");
     }
 
     #[test]
@@ -2555,6 +2667,8 @@ fn heic_thumbnail_jpeg(path: &str) -> Result<Vec<u8>, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    if let Some(code) = elevated_helper_exit_code(std::env::args_os().skip(1)) { std::process::exit(code); }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -2567,7 +2681,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, scan_file_names, stat_entries, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, create_folder_elevated, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, scan_file_names, stat_entries, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }

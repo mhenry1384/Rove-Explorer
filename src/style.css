@@ -72,6 +72,8 @@ html, body, #app { height: 100%; overflow: hidden; }
 .folders-editor { display: block; width: 100%; height: 340px; margin-top: 10px; resize: vertical; border: 1px solid var(--line); background: #fff; padding: 10px; font: 11px/1.6 'DM Mono'; color: var(--ink); outline: none; white-space: pre; tab-size: 2; }
 .folders-editor:focus { border-color: #a9b168; box-shadow: 0 0 0 3px #e8f0c8; }
 .folders-editor-error { min-height: 1.55em; margin-top: 8px !important; color: #b3261e; }
+.dialog-text-input { display: block; width: 100%; height: 30px; margin-top: 4px; border: 1px solid var(--line); background: #fff; padding: 0 8px; font: 11px 'DM Mono'; color: var(--ink); outline: none; }
+.dialog-text-input:focus { border-color: #a9b168; box-shadow: 0 0 0 3px #e8f0c8; }
 .dialog-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .dialog-actions span { flex: 1; }
 .dialog-actions button { height: 30px; padding: 0 14px; border: 1px solid var(--line); background: transparent; font: 500 10px 'DM Mono'; letter-spacing: .04em; color: var(--ink); }
