@@ -332,20 +332,29 @@ fn delete_entries(paths: Vec<String>) -> DeleteOutcome {
 }
 
 fn delete_entry(path: String) -> Result<Vec<TrashedItem>, String> {
-    let items = move_to_trash(&path)?;
+    let target = Path::new(&path);
+    // Windows refuses to delete a protected item (e.g. a system file at the root of C:) the same
+    // way it refuses one that's in use, so check whether permissions are really the cause.
+    let items = move_to_trash(&path).map_err(|error| if access_denied(target, DELETE) { NEEDS_ELEVATION.to_string() } else { error })?;
     // The shell recycles silently: an item that is in use is skipped yet the operation still
     // reports success, so check what is left behind. Whatever survived inside a folder is what
     // the other program has open (everything else already went to the Recycle Bin).
-    let target = Path::new(&path);
-    if !target.exists() { return Ok(items); }
+    if !still_exists(target) { return Ok(items); }
+    if access_denied(target, DELETE) { return Err(NEEDS_ELEVATION.to_string()); }
     let mut remaining = Vec::new();
     if target.is_dir() { collect_files(target, target, &mut remaining); }
+    if remaining.iter().any(|name| access_denied(&target.join(name), DELETE)) { return Err(NEEDS_ELEVATION.to_string()); }
     if remaining.is_empty() {
         return Err("It is being used by another program.".to_string());
     }
     let shown = remaining.iter().take(5).map(|name| format!("  {name}")).collect::<Vec<_>>().join("\n");
     let more = if remaining.len() > 5 { format!("\n  ...and {} more", remaining.len() - 5) } else { String::new() };
     Err(format!("These items inside it are being used by another program:\n{shown}{more}"))
+}
+
+// A file whose details can't be read (e.g. one only SYSTEM may open) is still there.
+fn still_exists(path: &Path) -> bool {
+    !matches!(path.try_exists(), Ok(false))
 }
 
 // The trashed items are looked up afterwards by find_trashed_items, once for the whole batch, since
@@ -550,14 +559,14 @@ struct PasteJob {
 }
 
 // The job decides what runs as administrator, so the returned handle stays open until the elevated
-// copy has finished: it lets others read the file but stops them changing or replacing it.
+// process has finished: it lets others read the file but stops them changing or replacing it.
 #[cfg(windows)]
-fn create_paste_job_file(job: &PasteJob) -> std::io::Result<(fs::File, PathBuf)> {
+fn create_job_file(job: &impl Serialize) -> std::io::Result<(fs::File, PathBuf)> {
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_SHARE_READ: u32 = 1;
     let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let path = std::env::temp_dir().join(format!("rove-paste-{}-{unique}.json", std::process::id()));
+    let path = std::env::temp_dir().join(format!("rove-job-{}-{unique}.json", std::process::id()));
     let mut file = fs::OpenOptions::new().write(true).create_new(true).share_mode(FILE_SHARE_READ).open(&path)?;
     file.write_all(&serde_json::to_vec(job)?)?;
     Ok((file, path))
@@ -577,7 +586,7 @@ fn paste_entries_elevated(window: tauri::WebviewWindow, paths: Vec<String>, dest
     {
         let names = || -> std::collections::HashSet<std::ffi::OsString> { fs::read_dir(&dest_dir).into_iter().flatten().flatten().map(|entry| entry.file_name()).collect() };
         let before = names();
-        let (job_file, job_path) = create_paste_job_file(&PasteJob { paths, dest_dir: dest_dir.clone(), cut, conflict_resolution }).map_err(|error| error.to_string())?;
+        let (job_file, job_path) = create_job_file(&PasteJob { paths, dest_dir: dest_dir.clone(), cut, conflict_resolution }).map_err(|error| error.to_string())?;
         let finished = run_elevated(&window, ELEVATED_PASTE, &[&job_path.to_string_lossy()]);
         drop(job_file);
         let _ = fs::remove_file(&job_path);
@@ -589,6 +598,49 @@ fn paste_entries_elevated(window: tauri::WebviewWindow, paths: Vec<String>, dest
         let _ = (window, paths, dest_dir, cut, conflict_resolution);
         Err("Pasting as administrator is only supported on Windows.".to_string())
     }
+}
+
+// Recycles the paths as administrator. None if the UAC prompt is declined. Whatever is still there
+// afterwards failed; what went can't be undone, since putting it back needs administrator rights too.
+#[tauri::command(async)]
+fn delete_entries_elevated(window: tauri::WebviewWindow, paths: Vec<String>) -> Result<Option<DeleteOutcome>, String> {
+    #[cfg(windows)]
+    {
+        let (job_file, job_path) = create_job_file(&paths).map_err(|error| error.to_string())?;
+        let finished = run_elevated(&window, ELEVATED_DELETE, &[&job_path.to_string_lossy()]);
+        drop(job_file);
+        let _ = fs::remove_file(&job_path);
+        let error = match finished { Ok(false) => return Ok(None), Ok(true) => None, Err(error) => Some(error) };
+        let mut outcome = DeleteOutcome { trashed: Vec::new(), failures: Vec::new() };
+        for path in paths {
+            if still_exists(Path::new(&path)) {
+                let error = error.clone().unwrap_or_else(|| "It is being used by another program.".to_string());
+                outcome.failures.push(DeleteFailure { path, error });
+            } else {
+                outcome.trashed.push(TrashedEntry { path, items: Vec::new() });
+            }
+        }
+        Ok(Some(outcome))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, paths);
+        Err("Deleting as administrator is only supported on Windows.".to_string())
+    }
+}
+
+// Runs as administrator. Goes on past a failure, then reports the last one: access denied (5) if
+// even an administrator may not delete it, otherwise a sharing violation (32), as it's in use.
+#[cfg(windows)]
+fn run_delete_job(job_path: &Path) -> std::io::Result<()> {
+    let paths: Vec<String> = serde_json::from_str(&fs::read_to_string(job_path)?)?;
+    let mut result = Ok(());
+    for path in &paths {
+        let _ = trash::delete(path);
+        let target = Path::new(path);
+        if still_exists(target) { result = Err(std::io::Error::from_raw_os_error(if access_denied(target, DELETE) { 5 } else { 32 })); }
+    }
+    result
 }
 
 #[cfg(windows)]
@@ -608,6 +660,8 @@ const ELEVATED_CREATE_FILE: &str = "--elevated-create-file";
 const ELEVATED_RENAME: &str = "--elevated-rename";
 #[cfg(windows)]
 const ELEVATED_PASTE: &str = "--elevated-paste";
+#[cfg(windows)]
+const ELEVATED_DELETE: &str = "--elevated-delete";
 
 // The exit code when this process is the copy of the app that UAC launched for one privileged job,
 // which it does before exiting without opening a window. None for a normal launch.
@@ -622,7 +676,8 @@ fn elevated_helper_exit_code(mut args: impl Iterator<Item = std::ffi::OsString>)
         (ELEVATED_CREATE_FILE, [path]) => fs::File::create_new(path).map(|_| ()),
         (ELEVATED_RENAME, [from, to]) => fs::rename(from, to),
         (ELEVATED_PASTE, [job]) => run_paste_job(Path::new(job)),
-        (ELEVATED_CREATE_FOLDER | ELEVATED_CREATE_FILE | ELEVATED_RENAME | ELEVATED_PASTE, _) => return Some(ERROR_INVALID_PARAMETER),
+        (ELEVATED_DELETE, [job]) => run_delete_job(Path::new(job)),
+        (ELEVATED_CREATE_FOLDER | ELEVATED_CREATE_FILE | ELEVATED_RENAME | ELEVATED_PASTE | ELEVATED_DELETE, _) => return Some(ERROR_INVALID_PARAMETER),
         _ => return None,
     };
     Some(match result { Ok(()) => 0, Err(error) => error.raw_os_error().unwrap_or(1) })
@@ -2009,7 +2064,7 @@ mod paste_entries_tests {
         fs::write(sandbox.path("a.txt"), "hello").unwrap();
         fs::create_dir_all(sandbox.path("dest")).unwrap();
         let job = PasteJob { paths: vec![sandbox.path("a.txt").to_string_lossy().to_string()], dest_dir: sandbox.path("dest").to_string_lossy().to_string(), cut: true, conflict_resolution: None };
-        let (file, job_path) = create_paste_job_file(&job).unwrap();
+        let (file, job_path) = create_job_file(&job).unwrap();
         assert!(fs::OpenOptions::new().write(true).open(&job_path).is_err(), "others can't change the job");
         assert_eq!(helper(ELEVATED_PASTE, &[&job_path]), Some(0));
         drop(file);
@@ -2046,6 +2101,8 @@ mod paste_entries_tests {
         let move_out = paste_entries(vec![held_text.clone()], open.clone(), true, None);
         let moved_copy_left = sandbox.path("open/held.txt").exists();
         let copy_out = paste_entries(vec![held_text.clone()], open.clone(), false, None);
+        let delete_file = delete_entry(held_text.clone());
+        let elevated_delete_left_it = held.exists();
         icacls(&locked, &["/remove:d", EVERYONE]);
         icacls(&held, &["/remove:d", EVERYONE]);
 
@@ -2056,6 +2113,8 @@ mod paste_entries_tests {
         assert_eq!(move_out.unwrap_err(), NEEDS_ELEVATION);
         assert!(!moved_copy_left, "a refused move leaves no copy behind");
         assert_eq!(copy_out.unwrap().len(), 1, "copying out only needs read access");
+        assert_eq!(delete_file.unwrap_err(), NEEDS_ELEVATION, "a protected file isn't reported as in use");
+        assert!(elevated_delete_left_it);
     }
 
     #[test]
@@ -2869,7 +2928,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, create_entry_elevated, rename_entry_elevated, paste_entries_elevated, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, scan_file_names, stat_entries, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, create_entry_elevated, rename_entry_elevated, paste_entries_elevated, delete_entries_elevated, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, scan_file_names, stat_entries, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }

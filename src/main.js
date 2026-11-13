@@ -858,7 +858,7 @@ async function deleteEntries(index, entries) {
   const targets = entries.filter((entry) => entry && entry.kind !== 'drive');
   if (!targets.length) return;
   const pane = state.panes[index]; const tab = currentTab(pane);
-  const { trashed, failures } = await invoke('delete_entries', { paths: targets.map((entry) => entry.path) });
+  const { trashed, failures } = await deleteWithElevation(targets.map((entry) => entry.path));
   // Search results can come from any subfolder; Undo reopens the folder the first one was in.
   rememberDelete(tab.view === 'search' ? parentPath(targets[0].path) : tab.path, trashed);
   const failedPaths = new Set(failures.map((failure) => failure.path));
@@ -873,6 +873,20 @@ async function deleteEntries(index, entries) {
   if (deletedIds.has(tab.anchorId)) tab.anchorId = tab.focusId;
   saveSession(); render();
   if (failures.length) await showDeleteFailures(failures.map(({ path, error }) => ({ name: itemName(path), error })));
+}
+
+// Items only an administrator may delete are tried again as administrator, after the Windows
+// prompt. What goes that way can't be undone, so it comes back with no trashed items.
+async function deleteWithElevation(paths) {
+  const { trashed, failures } = await invoke('delete_entries', { paths });
+  const denied = failures.filter(({ error }) => needsElevation(error));
+  if (!denied.length) return { trashed, failures };
+  const others = failures.filter(({ error }) => !needsElevation(error));
+  const declined = (error) => denied.map(({ path }) => ({ path, error }));
+  let outcome;
+  try { outcome = await invoke('delete_entries_elevated', { paths: denied.map(({ path }) => path) }); } catch (error) { return { trashed, failures: others.concat(declined(String(error))) }; }
+  if (!outcome) return { trashed, failures: others.concat(declined('You need administrator permission to delete it.')) };
+  return { trashed: trashed.concat(outcome.trashed), failures: others.concat(outcome.failures) };
 }
 
 async function showDeleteFailures(failures) {
@@ -1215,7 +1229,7 @@ function removeTreeNode(node, targetPath) {
 async function deleteTreeNode(index, path) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.treeState?.tree || path === tab.treeState.tree.path) return;
-  const { trashed, failures } = await invoke('delete_entries', { paths: [path] });
+  const { trashed, failures } = await deleteWithElevation([path]);
   if (failures.length) { render(); await showDeleteFailures([{ name: itemName(path), error: failures[0].error }]); return; }
   rememberDelete(parentPath(path), trashed);
   removeTreeNode(tab.treeState.tree, path);
@@ -1715,7 +1729,8 @@ function bindEvents() {
   const locationInput = document.querySelector('#location-input');
   // Select everything on focus; the mouseup that follows a click-to-focus would otherwise drop the selection to a caret.
   let justFocusedLocation = false;
-  locationInput.addEventListener('focus', (event) => { event.currentTarget.select(); justFocusedLocation = true; });
+  // The path is also copied to the clipboard, since that's usually why it was clicked.
+  locationInput.addEventListener('focus', (event) => { const input = event.currentTarget; input.select(); justFocusedLocation = true; if (input.value.trim()) writeText(input.value).catch((error) => console.error('copy path failed', error)); });
   locationInput.addEventListener('mouseup', (event) => { if (justFocusedLocation) event.preventDefault(); justFocusedLocation = false; });
   locationInput.addEventListener('blur', () => { justFocusedLocation = false; });
   locationInput.addEventListener('keydown', (event) => { if (event.key !== 'Enter') return; event.preventDefault(); const input = event.currentTarget; navigatePath(input.value).catch(() => input.select()); });
