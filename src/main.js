@@ -463,6 +463,22 @@ async function showHelpMenu(button) {
 }
 // Characters the OS won't accept in a file name (macOS reserves ':' because Finder displays it as '/').
 const INVALID_NAME_CHARS = isWindows ? /[\\/:*?"<>|]/ : isMac ? /[/:]/ : /\//;
+const INVALID_NAME_CHAR_LIST = isWindows ? '\\ / : * ? " < > |' : isMac ? ': /' : '/';
+
+// Like Explorer's balloon tip: shown under the rename box when a character the OS won't accept is typed.
+let nameTipTimer = null;
+function showInvalidNameTip(input) {
+  hideInvalidNameTip();
+  const tip = document.createElement('div');
+  tip.className = 'name-tip'; tip.setAttribute('role', 'alert');
+  tip.textContent = `A file name can't contain any of the following characters:\n${INVALID_NAME_CHAR_LIST}`;
+  document.body.append(tip);
+  const rect = input.getBoundingClientRect();
+  tip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - tip.offsetWidth - 8))}px`;
+  tip.style.top = rect.bottom + 6 + tip.offsetHeight > window.innerHeight ? `${rect.top - tip.offsetHeight - 6}px` : `${rect.bottom + 6}px`;
+  nameTipTimer = setTimeout(hideInvalidNameTip, 6000);
+}
+function hideInvalidNameTip() { clearTimeout(nameTipTimer); document.querySelector('.name-tip')?.remove(); }
 function textEditorLabel() { return platformName === 'macos' ? 'Edit in TextEdit' : 'Edit in Notepad'; }
 const TEXT_EDITOR_EXTENSIONS = new Set(['.txt', '.md', '.lst', '.bat', '.html', '.htm']);
 function canEditInTextEditor(pane) {
@@ -747,7 +763,7 @@ async function navigatePath(path) {
 
 function startRename(index, entry) { state.activePane = index; state.editing = { pane: index, entryId: entry.id, original: entry.name }; render(); const input = document.querySelector('[data-rename]'); input?.focus(); input?.select(); }
 
-function cancelRename() { state.editing = null; render(); }
+function cancelRename() { hideInvalidNameTip(); state.editing = null; render(); }
 
 // Pressing anywhere outside the rename box finishes the rename. Row presses call preventDefault (so focus
 // never leaves the box and its blur handler never runs), so this listens in the capture phase instead.
@@ -780,7 +796,14 @@ async function renameWithElevation(path, newName) {
 async function finishRename(index, entry, value) {
   if (!entry) { cancelRename(); return; }
   const newName = value.trim();
-  if (!newName || newName === entry.name || INVALID_NAME_CHARS.test(newName)) { cancelRename(); return; }
+  if (INVALID_NAME_CHARS.test(newName)) {
+    // Keep the box open, as Explorer does, so the name can be fixed.
+    const input = document.querySelector('[data-rename]');
+    if (input) { delete input.dataset.replaced; input.focus(); showInvalidNameTip(input); } else cancelRename();
+    return;
+  }
+  if (!newName || newName === entry.name) { cancelRename(); return; }
+  hideInvalidNameTip();
   state.editing = null;
   try {
     if (!await renameWithElevation(entry.path, newName)) { render(); return; }
@@ -1734,7 +1757,7 @@ function bindEvents() {
   locationInput.addEventListener('mouseup', (event) => { if (justFocusedLocation) event.preventDefault(); justFocusedLocation = false; });
   locationInput.addEventListener('blur', () => { justFocusedLocation = false; });
   locationInput.addEventListener('keydown', (event) => { if (event.key !== 'Enter') return; event.preventDefault(); const input = event.currentTarget; navigatePath(input.value).catch(() => input.select()); });
-  const renameInput = document.querySelector('[data-rename]'); renameInput?.addEventListener('click', (event) => event.stopPropagation()); renameInput?.addEventListener('keyup', (event) => { if (event.key === ' ') event.preventDefault(); /* else releasing Space "presses" the row button the box sits in */ }); renameInput?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelRename(); } if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); const entry = tabEntries(currentTab(state.panes[state.activePane])).find((item) => item.id === state.editing?.entryId); finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); } }); renameInput?.addEventListener('blur', (event) => { if (event.currentTarget.dataset.replaced) return; const entry = tabEntries(currentTab(state.panes[state.activePane])).find((item) => item.id === state.editing?.entryId); if (entry) finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); });
+  const renameInput = document.querySelector('[data-rename]'); renameInput?.addEventListener('click', (event) => event.stopPropagation()); renameInput?.addEventListener('beforeinput', (event) => { if (event.data && INVALID_NAME_CHARS.test(event.data)) { event.preventDefault(); showInvalidNameTip(event.currentTarget); } else if (event.inputType.startsWith('insert') || event.inputType.startsWith('delete')) hideInvalidNameTip(); }); renameInput?.addEventListener('keyup', (event) => { if (event.key === ' ') event.preventDefault(); /* else releasing Space "presses" the row button the box sits in */ }); renameInput?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelRename(); } if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); const entry = tabEntries(currentTab(state.panes[state.activePane])).find((item) => item.id === state.editing?.entryId); finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); } }); renameInput?.addEventListener('blur', (event) => { if (event.currentTarget.dataset.replaced) return; const entry = tabEntries(currentTab(state.panes[state.activePane])).find((item) => item.id === state.editing?.entryId); if (entry) finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); });
 }
 
 document.addEventListener('keydown', (event) => {

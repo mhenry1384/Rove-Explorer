@@ -92,3 +92,4 @@ html, body, #app { height: 100%; overflow: hidden; }
 .search-wrap { grid-template-columns: minmax(150px, 1.3fr) minmax(80px, 1fr) repeat(2, max-content); }
 .search-folder { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-folder em { font-style: normal; color: #b3b5ad; }
+.name-tip { position: fixed; z-index: 20; max-width: 320px; padding: 8px 10px; white-space: pre-line; font-size: 12px; line-height: 1.5; color: var(--ink); background: #fffbe6; border: 1px solid #c9b458; box-shadow: 0 4px 14px rgba(36,38,35,.18); pointer-events: none; }
