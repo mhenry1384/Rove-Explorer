@@ -6,11 +6,14 @@
 
 ## Release Builds
 
+- The version number is a single integer (e.g. v5, v6, v7), shown in the app as `v<N>`. Because
+  npm, Cargo and Tauri require semver, it is stored as `<N>.0.0` in the version files; only the
+  major part is displayed.
 - Before every release build, check `git status`. If there are uncommitted changes, bump the
-  version number first: increment the rightmost digit (e.g. 0.4.0 -> 0.4.1) in `package.json`,
+  version number first: increment the integer (e.g. 5.0.0 -> 6.0.0) in `package.json`,
   `package-lock.json` (both the top-level `version` and the one under `packages[""]`),
-  `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`. If the working tree is clean, keep the
-  current version.
+  `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and the `rove-explorer` entry in
+  `src-tauri/Cargo.lock`. If the working tree is clean, keep the current version.
 - Do not generate an installer during a release build unless the user explicitly asks for one.
   - On Windows: build the exe only, with no MSI or NSIS installer (`npm run tauri build -- --no-bundle`).
   - On macOS: build the app bundle only, with no DMG (`npm run tauri build -- --bundles app`).

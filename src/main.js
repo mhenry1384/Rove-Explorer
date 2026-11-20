@@ -9,7 +9,8 @@ import { ask, message } from '@tauri-apps/plugin-dialog';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { Menu, MenuItem, IconMenuItem, Submenu, PredefinedMenuItem } from '@tauri-apps/api/menu';
 import { startDrag } from '@crabnebula/tauri-plugin-drag';
-import { version as APP_VERSION } from '../package.json';
+import { version as PACKAGE_VERSION } from '../package.json';
+const APP_VERSION = PACKAGE_VERSION.split('.')[0];
 
 const SEP = sep();
 const isWindows = SEP === '\\';
