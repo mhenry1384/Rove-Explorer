@@ -315,19 +315,20 @@ const TRASH_NAME: &str = "Recycle Bin";
 const TRASH_NAME: &str = "Trash";
 
 #[tauri::command]
-fn delete_entries(paths: Vec<String>) -> DeleteOutcome {
+fn delete_entries(paths: Vec<String>, permanent: bool) -> DeleteOutcome {
     // Deletion times are kept in whole seconds, so allow some slack.
     #[cfg(not(target_os = "macos"))]
     let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|time| time.as_secs() as i64).unwrap_or(0) - 2;
     let mut outcome = DeleteOutcome { trashed: Vec::new(), failures: Vec::new() };
     for path in paths {
-        match delete_entry(path.clone()) {
+        let result = if permanent { delete_permanently(&path).map(|_| Vec::new()) } else { delete_entry(path.clone()) };
+        match result {
             Ok(items) => outcome.trashed.push(TrashedEntry { path, items }),
             Err(error) => outcome.failures.push(DeleteFailure { path, error }),
         }
     }
     #[cfg(not(target_os = "macos"))]
-    find_trashed_items(&mut outcome.trashed, started);
+    if !permanent { find_trashed_items(&mut outcome.trashed, started); }
     outcome
 }
 
@@ -340,16 +341,72 @@ fn delete_entry(path: String) -> Result<Vec<TrashedItem>, String> {
     // reports success, so check what is left behind. Whatever survived inside a folder is what
     // the other program has open (everything else already went to the Recycle Bin).
     if !still_exists(target) { return Ok(items); }
-    if access_denied(target, DELETE) { return Err(NEEDS_ELEVATION.to_string()); }
+    Err(left_behind_error(target))
+}
+
+// Deletes outright, skipping the trash, as Shift+Delete does. Like the shell it goes on past what
+// it can't delete, so whatever is left inside a folder is what's in use (or protected).
+fn delete_permanently(path: &str) -> Result<(), String> {
+    let target = Path::new(path);
+    let result = remove_path(target);
+    if !still_exists(target) { return Ok(()); }
+    match result {
+        Err(error) if !matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33)) => Err(error.to_string()),
+        _ => Err(left_behind_error(target)),
+    }
+}
+
+// Removes a file, a link (never what it points to) or a folder and everything in it. Returns the
+// last error, after removing all it could.
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    let file_type = fs::symlink_metadata(path)?.file_type();
+    if file_type.is_symlink() {
+        // A Windows link to a folder (or a junction) is removed as a folder, other links as files.
+        return fs::remove_file(path).or_else(|_| fs::remove_dir(path));
+    }
+    if !file_type.is_dir() { return remove_file_even_if_read_only(path); }
+    let mut result = Ok(());
+    for entry in fs::read_dir(path)? {
+        if let Err(error) = entry.and_then(|entry| remove_path(&entry.path())) { result = Err(error); }
+    }
+    match fs::remove_dir(path) {
+        Err(error) if result.is_ok() => Err(error),
+        _ => result,
+    }
+}
+
+// Windows won't delete a read-only file until the attribute is cleared; the shell clears it itself.
+fn remove_file_even_if_read_only(path: &Path) -> std::io::Result<()> {
+    let error = match fs::remove_file(path) { Ok(()) => return Ok(()), Err(error) => error };
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(5) {
+        if let Ok(metadata) = fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            if permissions.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                if fs::set_permissions(path, permissions.clone()).is_ok() {
+                    let retried = fs::remove_file(path);
+                    if retried.is_err() { permissions.set_readonly(true); let _ = fs::set_permissions(path, permissions); }
+                    return retried;
+                }
+            }
+        }
+    }
+    Err(error)
+}
+
+// Why a delete left `target` in place: it needs an administrator, or something has it (or some of
+// what's inside it) open.
+fn left_behind_error(target: &Path) -> String {
+    if access_denied(target, DELETE) { return NEEDS_ELEVATION.to_string(); }
     let mut remaining = Vec::new();
     if target.is_dir() { collect_files(target, target, &mut remaining); }
-    if remaining.iter().any(|name| access_denied(&target.join(name), DELETE)) { return Err(NEEDS_ELEVATION.to_string()); }
-    if remaining.is_empty() {
-        return Err("It is being used by another program.".to_string());
-    }
+    if remaining.iter().any(|name| access_denied(&target.join(name), DELETE)) { return NEEDS_ELEVATION.to_string(); }
+    if remaining.is_empty() { return "It is being used by another program.".to_string(); }
     let shown = remaining.iter().take(5).map(|name| format!("  {name}")).collect::<Vec<_>>().join("\n");
     let more = if remaining.len() > 5 { format!("\n  ...and {} more", remaining.len() - 5) } else { String::new() };
-    Err(format!("These items inside it are being used by another program:\n{shown}{more}"))
+    format!("These items inside it are being used by another program:\n{shown}{more}")
 }
 
 // A file whose details can't be read (e.g. one only SYSTEM may open) is still there.
@@ -603,10 +660,10 @@ fn paste_entries_elevated(window: tauri::WebviewWindow, paths: Vec<String>, dest
 // Recycles the paths as administrator. None if the UAC prompt is declined. Whatever is still there
 // afterwards failed; what went can't be undone, since putting it back needs administrator rights too.
 #[tauri::command(async)]
-fn delete_entries_elevated(window: tauri::WebviewWindow, paths: Vec<String>) -> Result<Option<DeleteOutcome>, String> {
+fn delete_entries_elevated(window: tauri::WebviewWindow, paths: Vec<String>, permanent: bool) -> Result<Option<DeleteOutcome>, String> {
     #[cfg(windows)]
     {
-        let (job_file, job_path) = create_job_file(&paths).map_err(|error| error.to_string())?;
+        let (job_file, job_path) = create_job_file(&DeleteJob { paths: paths.clone(), permanent }).map_err(|error| error.to_string())?;
         let finished = run_elevated(&window, ELEVATED_DELETE, &[&job_path.to_string_lossy()]);
         drop(job_file);
         let _ = fs::remove_file(&job_path);
@@ -624,19 +681,26 @@ fn delete_entries_elevated(window: tauri::WebviewWindow, paths: Vec<String>) -> 
     }
     #[cfg(not(windows))]
     {
-        let _ = (window, paths);
+        let _ = (window, paths, permanent);
         Err("Deleting as administrator is only supported on Windows.".to_string())
     }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Serialize, Deserialize)]
+struct DeleteJob {
+    paths: Vec<String>,
+    permanent: bool,
 }
 
 // Runs as administrator. Goes on past a failure, then reports the last one: access denied (5) if
 // even an administrator may not delete it, otherwise a sharing violation (32), as it's in use.
 #[cfg(windows)]
 fn run_delete_job(job_path: &Path) -> std::io::Result<()> {
-    let paths: Vec<String> = serde_json::from_str(&fs::read_to_string(job_path)?)?;
+    let job: DeleteJob = serde_json::from_str(&fs::read_to_string(job_path)?)?;
     let mut result = Ok(());
-    for path in &paths {
-        let _ = trash::delete(path);
+    for path in &job.paths {
+        if job.permanent { let _ = remove_path(Path::new(path)); } else { let _ = trash::delete(path); }
         let target = Path::new(path);
         if still_exists(target) { result = Err(std::io::Error::from_raw_os_error(if access_denied(target, DELETE) { 5 } else { 32 })); }
     }
@@ -1904,6 +1968,54 @@ mod paste_entries_tests {
         assert!(error.contains("being used by another program") && error.contains("photo.jpg"), "{error}");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn delete_permanently_reports_files_in_use() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let sandbox = Sandbox::new("delete-permanently-in-use");
+        let folder = sandbox.path("pix");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("photo.jpg"), b"x").unwrap();
+        fs::write(folder.join("other.jpg"), b"x").unwrap();
+        let lock = fs::OpenOptions::new().read(true).share_mode(0).open(folder.join("photo.jpg")).unwrap();
+        let error = delete_permanently(&folder.to_string_lossy()).unwrap_err();
+        drop(lock);
+        assert!(error.contains("being used by another program") && error.contains("photo.jpg"), "{error}");
+        assert!(!folder.join("other.jpg").exists(), "what isn't in use still goes");
+    }
+
+    #[test]
+    fn permanent_delete_skips_the_trash() {
+        let sandbox = Sandbox::new("delete-permanently");
+        fs::write(sandbox.path("note.txt"), b"x").unwrap();
+        fs::create_dir_all(sandbox.path("pix/trip")).unwrap();
+        fs::write(sandbox.path("pix/trip/beach.jpg"), b"x").unwrap();
+        fs::write(sandbox.path("pix/locked.txt"), b"x").unwrap();
+        let mut permissions = fs::metadata(sandbox.path("pix/locked.txt")).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(sandbox.path("pix/locked.txt"), permissions).unwrap();
+        let paths = ["note.txt", "pix"].map(|name| sandbox.path(name).to_string_lossy().to_string()).to_vec();
+        let outcome = delete_entries(paths, true);
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures.iter().map(|failure| &failure.error).collect::<Vec<_>>());
+        assert!(outcome.trashed.iter().all(|entry| entry.items.is_empty()), "nothing to undo");
+        assert!(!sandbox.path("note.txt").exists() && !sandbox.path("pix").exists());
+        #[cfg(not(target_os = "macos"))]
+        assert!(!trash::os_limited::list().unwrap().iter().any(|item| item.original_parent.starts_with(&sandbox.dir)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn permanent_delete_removes_a_link_but_not_its_target() {
+        let sandbox = Sandbox::new("delete-permanently-link");
+        fs::create_dir_all(sandbox.path("real")).unwrap();
+        fs::write(sandbox.path("real/keep.txt"), b"x").unwrap();
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(sandbox.path("link")).arg(sandbox.path("real")).output().unwrap();
+        assert!(made.status.success());
+        delete_permanently(&sandbox.path("link").to_string_lossy()).unwrap();
+        assert!(!sandbox.path("link").exists());
+        assert!(sandbox.path("real/keep.txt").exists());
+    }
+
     #[test]
     fn deleted_entries_can_be_restored() {
         let sandbox = Sandbox::new("delete-restore");
@@ -1913,7 +2025,7 @@ mod paste_entries_tests {
         fs::create_dir_all(sandbox.path("pix").join("trip")).unwrap();
         fs::write(sandbox.path("pix").join("trip").join("beach.jpg"), b"x").unwrap();
         let paths = ["note.txt", "pix"].map(|name| sandbox.path(name).to_string_lossy().to_string()).to_vec();
-        let outcome = delete_entries(paths);
+        let outcome = delete_entries(paths, false);
         assert!(outcome.failures.is_empty());
         assert!(!sandbox.path("note.txt").exists() && !sandbox.path("pix").exists());
         assert!(outcome.trashed.iter().all(|entry| !entry.items.is_empty()));
@@ -1932,7 +2044,7 @@ mod paste_entries_tests {
         let sandbox = Sandbox::new("restore-taken");
         fs::write(sandbox.path("a.txt"), b"old").unwrap();
         fs::write(sandbox.path("b.txt"), b"b").unwrap();
-        let outcome = delete_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string(), sandbox.path("b.txt").to_string_lossy().to_string()]);
+        let outcome = delete_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string(), sandbox.path("b.txt").to_string_lossy().to_string()], false);
         fs::write(sandbox.path("a.txt"), b"new").unwrap();
         let error = restore_entries(outcome.trashed).unwrap_err();
         assert!(error.contains("a.txt") && error.contains("already there"), "{error}");
@@ -2102,6 +2214,7 @@ mod paste_entries_tests {
         let moved_copy_left = sandbox.path("open/held.txt").exists();
         let copy_out = paste_entries(vec![held_text.clone()], open.clone(), false, None);
         let delete_file = delete_entry(held_text.clone());
+        let delete_file_permanently = delete_permanently(&held_text);
         let elevated_delete_left_it = held.exists();
         icacls(&locked, &["/remove:d", EVERYONE]);
         icacls(&held, &["/remove:d", EVERYONE]);
@@ -2114,6 +2227,7 @@ mod paste_entries_tests {
         assert!(!moved_copy_left, "a refused move leaves no copy behind");
         assert_eq!(copy_out.unwrap().len(), 1, "copying out only needs read access");
         assert_eq!(delete_file.unwrap_err(), NEEDS_ELEVATION, "a protected file isn't reported as in use");
+        assert_eq!(delete_file_permanently.unwrap_err(), NEEDS_ELEVATION);
         assert!(elevated_delete_left_it);
     }
 

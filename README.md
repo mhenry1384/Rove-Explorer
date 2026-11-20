@@ -8,7 +8,7 @@ A focused, dual-pane file explorer built with [Tauri](https://tauri.app) (Rust) 
 - Configurable list of favorite/pinned folders (`config/folders.json`)
 - Drive listing (Windows drives / mounted volumes)
 - Live directory watching — panes refresh automatically when the filesystem changes
-- Rename, delete (to trash, with up to five levels of undo), and open files/folders
+- Rename, delete (to trash, with up to five levels of undo, or permanently with Shift+Delete), and open files/folders
 - Folder size / item-count statistics computed recursively (Tree View), with cancellation support
 - Search view: lists every file under the current folder once, then shows the files whose name contains the text typed in the search box. Text with a `*` is a wildcard pattern for the whole name, so `P*.mov` finds names that start with P and end with .mov. Matching ignores case. It shows the total number of matches, and up to 100 of them). Right-click a result for the usual file commands plus **Open File Location**, which opens its folder in Details view with the file selected.
 - Tree View and Search view refuse folders containing more than 200,000 files and say there are too many files; this is a somewhat arbitrary limit we picked to keep scans and memory use reasonable.
@@ -58,7 +58,7 @@ A Mac build has to be made on a Mac. Install the Xcode command line tools (`xcod
 
 The build is unsigned, so the first launch is blocked by Gatekeeper: right-click the app and choose **Open**, or run `xattr -cr "Rove Explorer.app"`. macOS then asks for access to Desktop/Documents/Downloads the first time each is opened, and for permission to control Finder the first time Get Info is used.
 
-On a Mac the shortcuts follow Finder: ⌘⌫ moves to the Trash, ⌘[ / ⌘] go back and forward, ⌘↑ goes up a level and ⌘↓ opens. **Help → Keyboard Shortcuts** (or F1) lists them all.
+On a Mac the shortcuts follow Finder: ⌘⌫ moves to the Trash, ⌥⌘⌫ deletes permanently, ⌘[ / ⌘] go back and forward, ⌘↑ goes up a level and ⌘↓ opens. **Help → Keyboard Shortcuts** (or F1) lists them all.
 
 Other scripts:
 

@@ -409,6 +409,7 @@ const SHORTCUTS = [
   ['Edit', [
     [keys('F2'), 'Rename'],
     [isMac ? keys('⌘', '⌫') : keys('Delete'), `Move to the ${TRASH_NAME}`],
+    [isMac ? keys('⌥', '⌘', '⌫') : keys('Shift', 'Delete'), 'Delete permanently (asks first)'],
     [keys(isMac ? '⌘' : 'Ctrl', 'Z'), 'Undo the last delete'],
     [`${keys(isMac ? '⌘' : 'Ctrl', 'C')} ${keys(isMac ? '⌘' : 'Ctrl', 'X')} ${keys(isMac ? '⌘' : 'Ctrl', 'V')}`, 'Copy / cut / paste'],
   ]],
@@ -877,11 +878,12 @@ async function showRestored(index, action) {
   saveSession(); scrollSelectionIntoView = true; render();
 }
 
-async function deleteEntries(index, entries) {
+async function deleteEntries(index, entries, permanent = false) {
   const targets = entries.filter((entry) => entry && entry.kind !== 'drive');
   if (!targets.length) return;
+  if (permanent && !(await confirmPermanentDelete(targets))) return;
   const pane = state.panes[index]; const tab = currentTab(pane);
-  const { trashed, failures } = await deleteWithElevation(targets.map((entry) => entry.path));
+  const { trashed, failures } = await deleteWithElevation(targets.map((entry) => entry.path), permanent);
   // Search results can come from any subfolder; Undo reopens the folder the first one was in.
   rememberDelete(tab.view === 'search' ? parentPath(targets[0].path) : tab.path, trashed);
   const failedPaths = new Set(failures.map((failure) => failure.path));
@@ -900,14 +902,14 @@ async function deleteEntries(index, entries) {
 
 // Items only an administrator may delete are tried again as administrator, after the Windows
 // prompt. What goes that way can't be undone, so it comes back with no trashed items.
-async function deleteWithElevation(paths) {
-  const { trashed, failures } = await invoke('delete_entries', { paths });
+async function deleteWithElevation(paths, permanent = false) {
+  const { trashed, failures } = await invoke('delete_entries', { paths, permanent });
   const denied = failures.filter(({ error }) => needsElevation(error));
   if (!denied.length) return { trashed, failures };
   const others = failures.filter(({ error }) => !needsElevation(error));
   const declined = (error) => denied.map(({ path }) => ({ path, error }));
   let outcome;
-  try { outcome = await invoke('delete_entries_elevated', { paths: denied.map(({ path }) => path) }); } catch (error) { return { trashed, failures: others.concat(declined(String(error))) }; }
+  try { outcome = await invoke('delete_entries_elevated', { paths: denied.map(({ path }) => path), permanent }); } catch (error) { return { trashed, failures: others.concat(declined(String(error))) }; }
   if (!outcome) return { trashed, failures: others.concat(declined('You need administrator permission to delete it.')) };
   return { trashed: trashed.concat(outcome.trashed), failures: others.concat(outcome.failures) };
 }
@@ -919,11 +921,22 @@ async function showDeleteFailures(failures) {
   await message(`${intro}\n\n${details}${hint}`, { title: 'Delete failed', kind: 'error' });
 }
 
-function deleteSelected(index) {
+// Shift+Delete skips the trash, so it can't be undone; like Explorer, it asks first.
+async function confirmPermanentDelete(targets) {
+  const one = targets.length === 1 && targets[0];
+  const what = one ? `${one.kind === 'folder' ? 'this folder' : 'this file'}?
+
+${one.name || itemName(one.path)}` : `these ${targets.length} items?`;
+  return ask(`Are you sure you want to permanently delete ${what}
+
+This can't be undone.`, { title: 'Delete permanently', kind: 'warning', okLabel: 'Delete', cancelLabel: 'Cancel' });
+}
+
+function deleteSelected(index, permanent = false) {
   const pane = state.panes[index]; const tab = currentTab(pane);
-  if (tab?.view === 'tree') { if (tab.treeState?.selected) deleteTreeNode(index, tab.treeState.selected); return; }
+  if (tab?.view === 'tree') { if (tab.treeState?.selected) deleteTreeNode(index, tab.treeState.selected, permanent); return; }
   const entries = (tab?.selected || []).map((id) => tabEntries(tab).find((item) => item.id === id)).filter(Boolean);
-  if (entries.length) deleteEntries(index, entries);
+  if (entries.length) deleteEntries(index, entries, permanent);
 }
 
 function selectedFileEntries(index) {
@@ -1249,10 +1262,11 @@ function removeTreeNode(node, targetPath) {
   return null;
 }
 
-async function deleteTreeNode(index, path) {
+async function deleteTreeNode(index, path, permanent = false) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.treeState?.tree || path === tab.treeState.tree.path) return;
-  const { trashed, failures } = await deleteWithElevation([path]);
+  if (permanent && !(await confirmPermanentDelete([{ path, kind: 'folder' }]))) return;
+  const { trashed, failures } = await deleteWithElevation([path], permanent);
   if (failures.length) { render(); await showDeleteFailures([{ name: itemName(path), error: failures[0].error }]); return; }
   rememberDelete(parentPath(path), trashed);
   removeTreeNode(tab.treeState.tree, path);
@@ -1771,7 +1785,7 @@ document.addEventListener('keydown', (event) => {
   if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'c') { event.preventDefault(); copySelected(state.activePane); return; }
   if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'x') { event.preventDefault(); cutSelected(state.activePane); return; }
   if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'v') { event.preventDefault(); pasteIntoPane(state.activePane); return; }
-  if (event.key === 'Delete' && !isTyping) { event.preventDefault(); deleteSelected(state.activePane); return; }
+  if (event.key === 'Delete' && !isTyping && !event.ctrlKey && !event.metaKey && !event.altKey) { event.preventDefault(); deleteSelected(state.activePane, event.shiftKey); return; }
   // In a Mac text field Option+arrow moves by word, so there it only navigates outside of one.
   // Alt+1…4 switch the active pane's view, even from the search box. event.code, since on a Mac
   // Option+digit types a symbol rather than the digit.
@@ -1787,6 +1801,8 @@ document.addEventListener('keydown', (event) => {
   if (isTyping) return;
   // Finder's shortcuts: ⌘⌫ to Trash (Mac laptops have no forward-Delete key), ⌘[ / ⌘] back and
   // forward, ⌘↑ to the enclosing folder, ⌘↓ to open.
+  // ⌥⌘⌫ deletes immediately, skipping the Trash, as in Finder.
+  if (isMac && event.metaKey && event.altKey && event.key === 'Backspace') { event.preventDefault(); deleteSelected(state.activePane, true); return; }
   if (isMac && event.metaKey && !event.altKey) {
     const action = { Backspace: () => deleteSelected(state.activePane), '[': () => goBack(state.activePane), ']': () => goForward(state.activePane), ArrowUp: () => goUp(state.activePane), ArrowDown: () => enter(state.activePane, tab?.view !== 'tree' && tabEntries(tab).find((entry) => entry.id === tab.focusId)) }[event.key];
     if (action) { event.preventDefault(); action(); return; }

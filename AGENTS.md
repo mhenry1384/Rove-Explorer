@@ -17,3 +17,6 @@
   - When the user asks for an installer, build with `npm run tauri build`.
 - If Rove Explorer is running from `src-tauri/target/release/`, the build can't replace the exe.
   It's always fine to close the running app, build, and start it again without asking.
+- Don't hand the turn back while a release build is running. Wait for it to finish (it can take
+  over ten minutes, so run it in the background if needed), then start the new exe and carry on
+  with the rest of the task (e.g. committing) without checking in first.
