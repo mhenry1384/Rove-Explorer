@@ -9,6 +9,8 @@
 - The version number is a single integer (e.g. v5, v6, v7), shown in the app as `v<N>`. Because
   npm, Cargo and Tauri require semver, it is stored as `<N>.0.0` in the version files; only the
   major part is displayed.
+- After every change, do a release build (following the rules below) without being asked, then
+  start the new exe.
 - Before every release build, check `git status`. If there are uncommitted changes, bump the
   version number first: increment the integer (e.g. 5.0.0 -> 6.0.0) in `package.json`,
   `package-lock.json` (both the top-level `version` and the one under `packages[""]`),
