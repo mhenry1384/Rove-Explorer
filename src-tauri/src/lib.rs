@@ -3022,9 +3022,26 @@ fn heic_thumbnail_jpeg(path: &str) -> Result<Vec<u8>, String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// When started from a VS Code terminal (or another Electron app), we inherit variables like
+// ELECTRON_RUN_AS_NODE=1. Apps we launch would inherit them too, and an Electron app such as VS Code
+// then starts as plain Node and quits without opening a window, so drop them before anything runs.
+fn strip_inherited_electron_env() {
+    let names: Vec<_> = std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            name.starts_with("ELECTRON_") || name.starts_with("VSCODE_")
+        })
+        .collect();
+    for name in names {
+        std::env::remove_var(name);
+    }
+}
+
 pub fn run() {
     #[cfg(windows)]
     if let Some(code) = elevated_helper_exit_code(std::env::args_os().skip(1)) { std::process::exit(code); }
+    strip_inherited_electron_env();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
