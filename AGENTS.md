@@ -24,3 +24,9 @@
 - Don't hand the turn back while a release build is running. Wait for it to finish (it can take
   over ten minutes, so run it in the background if needed), then start the new exe and carry on
   with the rest of the task (e.g. committing) without checking in first.
+
+## Debug Builds
+
+- Don't build debug versions (`pnpm tauri dev`, `cargo build`, `cargo run`, or anything else that
+  writes to `src-tauri/target/debug/`) unless the user explicitly asks for one, or you need a debug
+  build to track down an issue. Use release builds otherwise.
