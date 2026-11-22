@@ -13,13 +13,12 @@
   start the new exe.
 - Before every release build, check `git status`. If there are uncommitted changes, bump the
   version number first: increment the integer (e.g. 5.0.0 -> 6.0.0) in `package.json`,
-  `package-lock.json` (both the top-level `version` and the one under `packages[""]`),
   `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and the `rove-explorer` entry in
   `src-tauri/Cargo.lock`. If the working tree is clean, keep the current version.
 - Do not generate an installer during a release build unless the user explicitly asks for one.
-  - On Windows: build the exe only, with no MSI or NSIS installer (`npm run tauri build -- --no-bundle`).
-  - On macOS: build the app bundle only, with no DMG (`npm run tauri build -- --bundles app`).
-  - When the user asks for an installer, build with `npm run tauri build`.
+  - On Windows: build the exe only, with no MSI or NSIS installer (`pnpm tauri build --no-bundle`).
+  - On macOS: build the app bundle only, with no DMG (`pnpm tauri build --bundles app`).
+  - When the user asks for an installer, build with `pnpm tauri build`.
 - If Rove Explorer is running from `src-tauri/target/release/`, the build can't replace the exe.
   It's always fine to close the running app, build, and start it again without asking.
 - Don't hand the turn back while a release build is running. Wait for it to finish (it can take

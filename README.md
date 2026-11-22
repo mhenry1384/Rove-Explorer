@@ -37,24 +37,24 @@ A focused, dual-pane file explorer built with [Tauri](https://tauri.app) (Rust) 
 Install dependencies:
 
 ```bash
-npm install
+pnpm install
 ```
 
 Run the app in development mode (opens a native window backed by a Vite dev server):
 
 ```bash
-npm run tauri dev
+pnpm tauri dev
 ```
 
 Build a production bundle:
 
 ```bash
-npm run tauri build
+pnpm tauri build
 ```
 
 ### macOS
 
-A Mac build has to be made on a Mac. Install the Xcode command line tools (`xcode-select --install`), Rust and Node, then use the same commands as above; `npm run tauri build` produces a `.app` and a `.dmg` under `src-tauri/target/release/bundle/`. For one app that runs on both Apple Silicon and Intel, run `rustup target add x86_64-apple-darwin aarch64-apple-darwin` and build with `npm run tauri build -- --target universal-apple-darwin`.
+A Mac build has to be made on a Mac. Install the Xcode command line tools (`xcode-select --install`), Rust and Node, then use the same commands as above; `pnpm tauri build` produces a `.app` and a `.dmg` under `src-tauri/target/release/bundle/`. For one app that runs on both Apple Silicon and Intel, run `rustup target add x86_64-apple-darwin aarch64-apple-darwin` and build with `pnpm tauri build --target universal-apple-darwin`.
 
 The build is unsigned, so the first launch is blocked by Gatekeeper: right-click the app and choose **Open**, or run `xattr -cr "Rove Explorer.app"`. macOS then asks for access to Desktop/Documents/Downloads the first time each is opened, and for permission to control Finder the first time Get Info is used.
 
@@ -63,9 +63,9 @@ On a Mac the shortcuts follow Finder: ⌘⌫ moves to the Trash, ⌥⌘⌫ delet
 Other scripts:
 
 ```bash
-npm run dev      # Vite dev server only (browser, no native shell)
-npm run build    # Build the frontend
-npm run preview  # Preview the built frontend
+pnpm dev      # Vite dev server only (browser, no native shell)
+pnpm build    # Build the frontend
+pnpm preview  # Preview the built frontend
 ```
 
 ## Configuration
