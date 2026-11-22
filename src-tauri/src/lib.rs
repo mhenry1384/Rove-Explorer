@@ -70,29 +70,24 @@ fn entry_kind_rank(kind: &str) -> u8 {
     if kind == "folder" { 0 } else { 1 }
 }
 
+// Uses the attributes from the directory listing: GetFileAttributesW fails on files the system holds
+// open exclusively (pagefile.sys, swapfile.sys, hiberfil.sys), which would wrongly show them.
 #[cfg(windows)]
-fn is_hidden(path: &Path, name: &str) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-
-    extern "system" {
-        fn GetFileAttributesW(path: *const u16) -> u32;
-    }
-
-    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let attributes = unsafe { GetFileAttributesW(wide_path.as_ptr()) };
-    name.starts_with('.') || (attributes != u32::MAX && attributes & (0x2 | 0x4) != 0)
+fn is_hidden(name: &str, metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    name.starts_with('.') || metadata.file_attributes() & (0x2 | 0x4) != 0
 }
 
 // Finder also hides items carrying the UF_HIDDEN flag (~/Library, /bin, /usr, ...), not just dotfiles.
 #[cfg(target_os = "macos")]
-fn is_hidden(path: &Path, name: &str) -> bool {
+fn is_hidden(name: &str, metadata: &fs::Metadata) -> bool {
     use std::os::macos::fs::MetadataExt;
     const UF_HIDDEN: u32 = 0x8000;
-    name.starts_with('.') || fs::symlink_metadata(path).map(|metadata| metadata.st_flags() & UF_HIDDEN != 0).unwrap_or(false)
+    name.starts_with('.') || metadata.st_flags() & UF_HIDDEN != 0
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn is_hidden(_path: &Path, name: &str) -> bool {
+fn is_hidden(name: &str, _metadata: &fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
@@ -226,7 +221,7 @@ fn read_directory(path: String, show_hidden: bool) -> Result<Vec<Entry>, String>
         .filter_map(|item| {
             let metadata = item.metadata().ok()?;
             let name = item.file_name().to_string_lossy().to_string();
-            if !show_hidden && is_hidden(&item.path(), &name) { return None; }
+            if !show_hidden && is_hidden(&name, &metadata) { return None; }
             Some(entry_from_metadata(&item.path(), name, &metadata))
         }).collect::<Vec<_>>();
     entries.sort_by(|left, right| entry_kind_rank(&left.kind).cmp(&entry_kind_rank(&right.kind)).then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase())));
@@ -2608,7 +2603,7 @@ async fn scan_file_names(app: AppHandle, request_id: String, path: String, show_
                 }
                 let Ok(metadata) = entry.metadata() else { continue };
                 let entry_path = entry.path();
-                if !show_hidden && is_hidden(&entry_path, &entry.file_name().to_string_lossy()) {
+                if !show_hidden && is_hidden(&entry.file_name().to_string_lossy(), &metadata) {
                     continue;
                 }
                 if metadata.is_dir() {
