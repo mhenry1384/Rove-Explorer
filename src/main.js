@@ -496,15 +496,23 @@ function singleSelectedFile(index) { const entries = selectedFileEntries(index);
 
 // Looks the apps up as soon as a single file is selected, so they're usually ready by the time
 // the context menu opens (a native menu can't change once it's showing).
+function fetchOpenWithApps(entry) {
+  const key = openWithKey(entry);
+  const pending = invoke('list_open_with_apps', { path: entry.path }).catch(() => []).then((apps) => { openWithCache.set(key, apps); return apps; });
+  openWithCache.set(key, pending);
+  return pending;
+}
 function prefetchOpenWithApps() {
   if (!(platformName === 'windows' || platformName === 'macos')) return;
   state.panes.forEach((_, index) => {
     const entry = singleSelectedFile(index);
-    if (!entry || openWithCache.has(openWithKey(entry))) return;
-    const key = openWithKey(entry);
-    openWithCache.set(key, invoke('list_open_with_apps', { path: entry.path }).catch(() => []).then((apps) => { openWithCache.set(key, apps); return apps; }));
+    if (entry && !openWithCache.has(openWithKey(entry))) fetchOpenWithApps(entry);
   });
 }
+
+// How long the context menu waits for an extension's apps that are still loading. Once they're
+// cached there's no wait at all.
+const OPEN_WITH_WAIT_MS = 500;
 
 function dataUriBytes(uri) { return Uint8Array.from(atob(uri.slice(uri.indexOf(',') + 1)), (char) => char.charCodeAt(0)); }
 
@@ -512,9 +520,10 @@ function openWith(path, command, args) {
   invoke(command, { path, ...args }).catch((error) => message(String(error), { title: 'Open With failed', kind: 'error' }));
 }
 
-// Apps still loading are left out; "Choose another app" is always there.
+// Apps still loading after OPEN_WITH_WAIT_MS are left out; "Choose another app" is always there.
 async function openWithSubmenu(entry) {
-  const cached = openWithCache.get(openWithKey(entry));
+  let cached = openWithCache.get(openWithKey(entry)) ?? fetchOpenWithApps(entry);
+  if (!Array.isArray(cached)) cached = await Promise.race([cached, new Promise((resolve) => setTimeout(() => resolve([]), OPEN_WITH_WAIT_MS))]);
   const apps = Array.isArray(cached) ? cached : [];
   const appItems = await Promise.all(apps.map((app) => {
     const action = () => openWith(entry.path, 'open_with_app', { appId: app.id });
