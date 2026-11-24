@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "rove-explorer"
-version = "9.0.0"
+version = "10.0.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",

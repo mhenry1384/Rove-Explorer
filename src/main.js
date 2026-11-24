@@ -430,12 +430,30 @@ async function withProgress(title, paths, measure, work) {
   const op = { opId: `op-${++fileOpCount}`, measure, workStarted: null };
   fileOp = op;
   const what = paths.length === 1 ? `"${itemName(paths[0])}"` : `${paths.length.toLocaleString()} items`;
-  progressRoot.innerHTML = `<div class="progress-backdrop" data-progress><section class="dialog progress-dialog" role="dialog" aria-modal="true" aria-label="${escapeAttribute(title)}"><header class="dialog-head"><h2>${escapeAttribute(title)} ${escapeAttribute(what)}</h2></header><div class="dialog-body"><p class="progress-line" data-progress-line>Working…</p><div class="progress-track is-indeterminate" data-progress-track><div class="progress-fill" data-progress-fill></div></div><p class="progress-current" data-progress-current></p></div></section></div>`;
+  progressRoot.innerHTML = `<div class="progress-backdrop" data-progress><section class="dialog progress-dialog" role="dialog" aria-modal="true" aria-label="${escapeAttribute(title)}"><header class="dialog-head"><h2>${escapeAttribute(title)} ${escapeAttribute(what)}</h2></header><div class="dialog-body"><p class="progress-line" data-progress-line>Working…</p><div class="progress-track is-indeterminate" data-progress-track><div class="progress-fill" data-progress-fill></div></div><p class="progress-current" data-progress-current></p><div class="dialog-actions"><span></span><button data-progress-cancel>Cancel</button></div></div></section></div>`;
+  progressRoot.querySelector('[data-progress-cancel]').addEventListener('click', cancelFileOp);
   const timer = setTimeout(() => progressRoot.querySelector('[data-progress]')?.classList.add('is-visible'), 400);
   try { return await work(op.opId); } finally {
     clearTimeout(timer);
     if (fileOp === op) { fileOp = null; progressRoot.innerHTML = ''; }
   }
+}
+
+// Stops after the file it's on; what's done stays done, as in Explorer.
+function cancelFileOp() {
+  const button = progressRoot.querySelector('[data-progress-cancel]');
+  if (!fileOp || !button || button.disabled) return;
+  button.disabled = true; button.textContent = 'Cancelling…';
+  invoke('cancel_file_op', { opId: fileOp.opId }).catch((error) => console.error('cancel_file_op failed', error));
+}
+
+// What runs as administrator can't be stopped from here.
+function stopOfferingCancel() { progressRoot.querySelector('[data-progress-cancel]')?.remove(); }
+
+function showCancelled(at, done) {
+  if (!at) return Promise.resolve();
+  const files = `${at.doneFiles.toLocaleString()} of ${at.totalFiles.toLocaleString()} file${at.totalFiles === 1 ? '' : 's'}`;
+  return message(`Cancelled. ${files} had already been ${done}.`, { title: 'Cancelled', kind: 'info' });
 }
 
 function showFileOpProgress(report) {
@@ -941,11 +959,12 @@ async function deleteEntries(index, entries, permanent = false) {
   if (!targets.length) return;
   if (permanent && !(await confirmPermanentDelete(targets))) return;
   const pane = state.panes[index]; const tab = currentTab(pane);
-  const { trashed, failures } = await deleteWithElevation(targets.map((entry) => entry.path), permanent);
+  const { trashed, failures, cancelled } = await deleteWithElevation(targets.map((entry) => entry.path), permanent);
   // Search results can come from any subfolder; Undo reopens the folder the first one was in.
   rememberDelete(tab.view === 'search' ? parentPath(targets[0].path) : tab.path, trashed);
-  const failedPaths = new Set(failures.map((failure) => failure.path));
-  const deletedIds = new Set(targets.filter((entry) => !failedPaths.has(entry.path)).map((entry) => entry.id));
+  // A cancelled delete leaves the rest (and a folder it was partway through) in place.
+  const deletedPaths = new Set(trashed.filter((entry) => !entry.partial).map((entry) => entry.path));
+  const deletedIds = new Set(targets.filter((entry) => deletedPaths.has(entry.path)).map((entry) => entry.id));
   if (tab.view === 'search' && tab.searchState) {
     removeFromSearchIndex(tab.searchState, deletedIds);
     await updateSearchMatches(tab);
@@ -955,6 +974,7 @@ async function deleteEntries(index, entries, permanent = false) {
   if (deletedIds.has(tab.focusId)) tab.focusId = null;
   if (deletedIds.has(tab.anchorId)) tab.anchorId = tab.focusId;
   saveSession(); render();
+  await showCancelled(cancelled, deletedDescription(permanent));
   if (failures.length) await showDeleteFailures(failures.map(({ path, error }) => ({ name: itemName(path), error })));
 }
 
@@ -966,15 +986,21 @@ async function deleteWithElevation(paths, permanent = false) {
 }
 
 async function deleteWithElevationNow(paths, permanent, opId) {
-  const { trashed, failures } = await invoke('delete_entries', { paths, permanent, opId });
+  const { trashed, failures, cancelled } = await invoke('delete_entries', { paths, permanent, opId });
+  if (cancelled) return { trashed, failures, cancelled };
   const denied = failures.filter(({ error }) => needsElevation(error));
   if (!denied.length) return { trashed, failures };
   const others = failures.filter(({ error }) => !needsElevation(error));
   const declined = (error) => denied.map(({ path }) => ({ path, error }));
   let outcome;
+  stopOfferingCancel();
   try { outcome = await invoke('delete_entries_elevated', { paths: denied.map(({ path }) => path), permanent }); } catch (error) { return { trashed, failures: others.concat(declined(String(error))) }; }
   if (!outcome) return { trashed, failures: others.concat(declined('You need administrator permission to delete it.')) };
   return { trashed: trashed.concat(outcome.trashed), failures: others.concat(outcome.failures) };
+}
+
+function deletedDescription(permanent) {
+  return permanent ? 'deleted' : `moved to the ${TRASH_NAME} (Undo puts them back)`;
 }
 
 async function showDeleteFailures(failures) {
@@ -1033,10 +1059,17 @@ async function pasteWithElevation(args) {
     return await withProgress(args.cut ? 'Moving' : 'Copying', args.paths, 'bytes', async (opId) => {
       try { return await invoke('paste_entries', { ...args, opId }); } catch (error) {
         if (!needsElevation(error)) throw error;
+        stopOfferingCancel();
         return await invoke('paste_entries_elevated', args);
       }
     });
   } catch (error) {
+    // "cancelled:<files done>:<files in all>". What got copied stays, so the folder still refreshes.
+    const cancelled = /^cancelled:(\d+):(\d+)$/.exec(String(error));
+    if (cancelled) {
+      await showCancelled({ doneFiles: Number(cancelled[1]), totalFiles: Number(cancelled[2]) }, args.cut ? 'moved' : 'copied');
+      return [];
+    }
     await message(`Couldn't finish copying or moving.\n\n${error}`, { title: 'Paste failed', kind: 'error' });
     return null;
   }
@@ -1331,7 +1364,8 @@ async function deleteTreeNode(index, path, permanent = false) {
   const tab = currentTab(state.panes[index]);
   if (!tab?.treeState?.tree || path === tab.treeState.tree.path) return;
   if (permanent && !(await confirmPermanentDelete([{ path, kind: 'folder' }]))) return;
-  const { trashed, failures } = await deleteWithElevation([path], permanent);
+  const { trashed, failures, cancelled } = await deleteWithElevation([path], permanent);
+  if (cancelled) { rememberDelete(parentPath(path), trashed); render(); await showCancelled(cancelled, deletedDescription(permanent)); return; }
   if (failures.length) { render(); await showDeleteFailures([{ name: itemName(path), error: failures[0].error }]); return; }
   rememberDelete(parentPath(path), trashed);
   removeTreeNode(tab.treeState.tree, path);
@@ -1840,8 +1874,8 @@ function bindEvents() {
 }
 
 document.addEventListener('keydown', (event) => {
-  // While a delete, copy or move is running, the keyboard waits for it.
-  if (fileOp) { event.preventDefault(); return; }
+  // While a delete, copy or move is running, the keyboard waits for it; Escape cancels it.
+  if (fileOp) { event.preventDefault(); if (event.key === 'Escape' && progressRoot.querySelector('.is-visible')) cancelFileOp(); return; }
   // An open dialog takes the keyboard; Tab and Enter still work on its buttons and link.
   if (isDialogOpen()) { if (event.key === 'Escape') { event.preventDefault(); closeDialog(); } return; }
   if (event.key === 'F1') { event.preventDefault(); showShortcuts(); return; }

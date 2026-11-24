@@ -290,6 +290,9 @@ struct TrashedItem {
 struct TrashedEntry {
     path: String,
     items: Vec<TrashedItem>,
+    // A folder whose delete was cancelled partway: some of what was in it went to the trash.
+    #[serde(default)]
+    partial: bool,
 }
 
 #[derive(Serialize)]
@@ -302,6 +305,15 @@ struct DeleteFailure {
 struct DeleteOutcome {
     trashed: Vec<TrashedEntry>,
     failures: Vec<DeleteFailure>,
+    // Set when the delete was cancelled, with how far it had got.
+    cancelled: Option<CancelledAt>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelledAt {
+    done_files: u64,
+    total_files: u64,
 }
 
 #[cfg(windows)]
@@ -319,18 +331,26 @@ fn delete_paths(paths: Vec<String>, permanent: bool, progress: &mut Progress) ->
     // Deletion times are kept in whole seconds, so allow some slack.
     #[cfg(not(target_os = "macos"))]
     let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|time| time.as_secs() as i64).unwrap_or(0) - 2;
-    let mut outcome = DeleteOutcome { trashed: Vec::new(), failures: Vec::new() };
+    let mut outcome = DeleteOutcome { trashed: Vec::new(), failures: Vec::new(), cancelled: None };
     // Count everything first, so the progress can say how far along it is.
     let finished_at: Vec<u64> = paths.iter().map(|path| { progress.tally(Path::new(path)); progress.report.total_files }).collect();
     progress.begin();
     for (path, finished_at) in paths.into_iter().zip(finished_at) {
+        if progress.cancelled() { break; }
         let result = if permanent { delete_permanently(&path, progress).map(|_| Vec::new()) } else { delete_entry(path.clone(), progress) };
+        // Like Explorer, a cancelled delete stops where it got to: an item it was partway through
+        // isn't a failure, and Undo brings back whatever of it went to the trash.
+        if progress.cancelled() && still_exists(Path::new(&path)) {
+            if !permanent { outcome.trashed.push(TrashedEntry { path, items: Vec::new(), partial: true }); }
+            break;
+        }
         progress.reach(Path::new(&path), finished_at);
         match result {
-            Ok(items) => outcome.trashed.push(TrashedEntry { path, items }),
+            Ok(items) => outcome.trashed.push(TrashedEntry { path, items, partial: false }),
             Err(error) => outcome.failures.push(DeleteFailure { path, error }),
         }
     }
+    if progress.cancelled() { outcome.cancelled = Some(CancelledAt { done_files: progress.report.done_files, total_files: progress.report.total_files }); }
     #[cfg(not(target_os = "macos"))]
     if !permanent { find_trashed_items(&mut outcome.trashed, started); }
     outcome
@@ -363,6 +383,7 @@ fn delete_permanently(path: &str, progress: &mut Progress) -> Result<(), String>
 // Removes a file, a link (never what it points to) or a folder and everything in it. Returns the
 // last error, after removing all it could.
 fn remove_path(path: &Path, progress: &mut Progress) -> std::io::Result<()> {
+    if progress.cancelled() { return Err(cancelled_error()); }
     let file_type = fs::symlink_metadata(path)?.file_type();
     if file_type.is_symlink() {
         // A Windows link to a folder (or a junction) is removed as a folder, other links as files.
@@ -377,6 +398,7 @@ fn remove_path(path: &Path, progress: &mut Progress) -> std::io::Result<()> {
     }
     let mut result = Ok(());
     for entry in fs::read_dir(path)? {
+        if progress.cancelled() { return Err(cancelled_error()); }
         if let Err(error) = entry.and_then(|entry| remove_path(&entry.path(), progress)) { result = Err(error); }
     }
     match fs::remove_dir(path) {
@@ -459,6 +481,7 @@ fn move_to_trash_reporting(path: &str, progress: &mut Progress) -> Result<Vec<Tr
     list_files(root, &mut files);
     let mut last_error = None;
     for batch in files.chunks(BATCH) {
+        if progress.cancelled() { return Err(CANCELLED.to_string()); }
         if let Err(error) = trash::delete_all(batch) { last_error = Some(readable_trash_error(error)); }
         progress.step(&batch[batch.len() - 1], batch.len() as u64, 0);
     }
@@ -484,6 +507,33 @@ fn list_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if self.report.op_id.is_empty() { return; }
+        if let Ok(mut running) = running_file_ops().lock() { running.remove(&self.report.op_id); }
+    }
+}
+
+// The cancel flags of the deletes, copies and moves under way, by the id the window gave them.
+fn running_file_ops() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    static RUNNING: std::sync::OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = std::sync::OnceLock::new();
+    RUNNING.get_or_init(Default::default)
+}
+
+// What a cancelled copy or move fails with; the window knows it from a real error.
+const CANCELLED: &str = "cancelled";
+
+fn cancelled_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, CANCELLED)
+}
+
+// Stops the delete, copy or move with this id after the file it's on (a big file being copied is
+// abandoned and its partial copy removed). What's already done stays done, as in Explorer.
+#[tauri::command]
+fn cancel_file_op(op_id: String) {
+    if let Some(cancel) = running_file_ops().lock().ok().and_then(|running| running.get(&op_id).cloned()) { cancel.store(true, Ordering::Relaxed); }
+}
+
 // Progress of a long delete, copy or move, sent to the window as "file-op-progress" events (at
 // most every 100ms) under the id the window gave the operation. Silent without one.
 #[derive(Clone, Default, Serialize)]
@@ -502,13 +552,15 @@ struct FileOpProgress {
 // code (and the system DLLs it needs) out of the unit tests.
 struct Progress {
     send_to: Option<Box<dyn Fn(&FileOpProgress)>>,
+    // Set by cancel_file_op. The work checks it between files and stops.
+    cancel: Arc<AtomicBool>,
     report: FileOpProgress,
     last_sent: Option<Instant>,
 }
 
 impl Progress {
     fn silent() -> Self {
-        Progress { send_to: None, report: FileOpProgress { counting: true, ..Default::default() }, last_sent: None }
+        Progress { send_to: None, cancel: Arc::new(AtomicBool::new(false)), report: FileOpProgress { counting: true, ..Default::default() }, last_sent: None }
     }
 
     fn new(app: &AppHandle, op_id: Option<String>) -> Self {
@@ -516,9 +568,14 @@ impl Progress {
         if let Some(op_id) = op_id {
             let app = app.clone();
             progress.send_to = Some(Box::new(move |report| { let _ = app.emit("file-op-progress", report); }));
+            if let Ok(mut running) = running_file_ops().lock() { running.insert(op_id.clone(), progress.cancel.clone()); }
             progress.report.op_id = op_id;
         }
         progress
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     // Adds what's at `path` (a file, or all the files in a folder, not following links) to the totals.
@@ -611,7 +668,7 @@ fn restore_entries(entries: Vec<TrashedEntry>) -> Result<(), String> {
     let mut problems = Vec::new();
     for entry in entries {
         let name = item_name(&entry.path);
-        if Path::new(&entry.path).exists() {
+        if Path::new(&entry.path).exists() && !entry.partial {
             problems.push(format!("{name}: an item with that name is already there."));
         } else if entry.items.is_empty() {
             problems.push(format!("{name}: it's no longer in the {TRASH_NAME}."));
@@ -809,13 +866,13 @@ fn delete_entries_elevated(window: tauri::WebviewWindow, paths: Vec<String>, per
         drop(job_file);
         let _ = fs::remove_file(&job_path);
         let error = match finished { Ok(false) => return Ok(None), Ok(true) => None, Err(error) => Some(error) };
-        let mut outcome = DeleteOutcome { trashed: Vec::new(), failures: Vec::new() };
+        let mut outcome = DeleteOutcome { trashed: Vec::new(), failures: Vec::new(), cancelled: None };
         for path in paths {
             if still_exists(Path::new(&path)) {
                 let error = error.clone().unwrap_or_else(|| "It is being used by another program.".to_string());
                 outcome.failures.push(DeleteFailure { path, error });
             } else {
-                outcome.trashed.push(TrashedEntry { path, items: Vec::new() });
+                outcome.trashed.push(TrashedEntry { path, items: Vec::new(), partial: false });
             }
         }
         Ok(Some(outcome))
@@ -1896,6 +1953,7 @@ fn copy_dir_recursive(source: &Path, dest: &Path, progress: &mut Progress) -> st
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
+        if progress.cancelled() { return Err(cancelled_error()); }
         let target = dest.join(entry.file_name());
         if entry.file_type()?.is_dir() {
             copy_dir_recursive(&entry.path(), &target, progress)?;
@@ -1909,10 +1967,15 @@ fn copy_dir_recursive(source: &Path, dest: &Path, progress: &mut Progress) -> st
 // fs::copy, counting the file towards the progress. A big file is copied with a callback that
 // reports how much of it is done, so the progress keeps moving while it copies.
 fn copy_file(source: &Path, target: &Path, progress: &mut Progress) -> std::io::Result<u64> {
+    if progress.cancelled() { return Err(cancelled_error()); }
     #[cfg(windows)]
     if progress.send_to.is_some() && fs::metadata(source).map(|metadata| metadata.len() >= 32 << 20).unwrap_or(false) {
         // If this fails (e.g. on a path too long for it), fs::copy tries again and gives the error.
-        if let Ok(bytes) = copy_big_file(source, target, progress) { progress.step(source, 1, 0); return Ok(bytes); }
+        match copy_big_file(source, target, progress) {
+            Ok(bytes) => { progress.step(source, 1, 0); return Ok(bytes); }
+            Err(_) if progress.cancelled() => return Err(cancelled_error()),
+            Err(_) => {}
+        }
     }
     let bytes = fs::copy(source, target)?;
     progress.step(source, 1, bytes);
@@ -1937,7 +2000,8 @@ fn copy_big_file(source: &Path, target: &Path, progress: &mut Progress) -> std::
             copying.reported = transferred;
             copying.progress.step(copying.source, 0, added);
         }
-        0 // PROGRESS_CONTINUE
+        // PROGRESS_CANCEL stops the copy and deletes the partial file; PROGRESS_CONTINUE goes on.
+        if copying.progress.cancelled() { 1 } else { 0 }
     }
     let wide = |path: &Path| path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
     let (source_wide, target_wide) = (wide(source), wide(target));
@@ -2036,6 +2100,7 @@ fn merge_dir_recursive(source: &Path, dest: &Path, cut: bool, resolution: Confli
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
+        if progress.cancelled() { return Err(cancelled_error()); }
         let entry_path = entry.path();
         let target = dest.join(entry.file_name());
         if entry.file_type()?.is_dir() {
@@ -2087,7 +2152,10 @@ fn paste_entries(app: AppHandle, paths: Vec<String>, dest_dir: String, cut: bool
 fn paste_paths(paths: Vec<String>, dest_dir: String, cut: bool, conflict_resolution: Option<String>, progress: &mut Progress) -> Result<Vec<String>, String> {
     let dest = Path::new(&dest_dir);
     if paste_needs_elevation(&paths, dest, cut) { return Err(NEEDS_ELEVATION.to_string()); }
-    paste_items(&paths, dest, cut, conflict_resolution.as_deref(), progress).map_err(|error| error.to_string())
+    // A cancelled paste reports how far it got as "cancelled:<files done>:<files in all>".
+    paste_items(&paths, dest, cut, conflict_resolution.as_deref(), progress).map_err(|error| {
+        if progress.cancelled() { format!("{CANCELLED}:{}:{}", progress.report.done_files, progress.report.total_files) } else { error.to_string() }
+    })
 }
 
 // Whether pasting `source` copies its contents, rather than doing nothing or renaming it.
@@ -2106,6 +2174,7 @@ fn paste_items(paths: &[String], dest: &Path, cut: bool, conflict_resolution: Op
     }
     progress.begin();
     for source_path in paths {
+        if progress.cancelled() { return Err(cancelled_error()); }
         let source = Path::new(source_path);
         let Some(name) = source.file_name().map(|value| value.to_string_lossy().to_string()) else { continue };
         if cut && source.parent() == Some(dest) {
@@ -2132,7 +2201,9 @@ fn paste_items(paths: &[String], dest: &Path, cut: bool, conflict_resolution: Op
             if fs::rename(source, &target).is_err() {
                 if !paste_copies(source, dest, cut) { progress.tally(source); }
                 if source.is_dir() {
-                    copy_dir_recursive(source, &target, progress)?;
+                    // File by file, as Explorer does, so a cancelled move leaves each file in just
+                    // one of the two places.
+                    merge_dir_recursive(source, &target, true, ConflictResolution::Skip, progress)?;
                     fs::remove_dir_all(source)?;
                 } else {
                     copy_file(source, &target, progress)?;
@@ -2274,6 +2345,39 @@ mod paste_entries_tests {
         assert_eq!((progress.report.done_files, progress.report.total_files), (450, 450));
         restore_entries(outcome.trashed).unwrap();
         assert_eq!(fs::read_dir(folder.join("b/c")).unwrap().count(), 150);
+    }
+
+    #[test]
+    fn cancelled_copy_and_delete_stop_and_say_how_far_they_got() {
+        let source_sandbox = Sandbox::new("cancel-src");
+        let dest_sandbox = Sandbox::new("cancel-dest");
+        fs::create_dir_all(source_sandbox.path("folder")).unwrap();
+        for index in 0..5 { fs::write(source_sandbox.path("folder").join(format!("{index}.txt")), b"x").unwrap(); }
+        let source = source_sandbox.path("folder").to_string_lossy().to_string();
+        let mut progress = Progress::silent();
+        progress.cancel.store(true, Ordering::Relaxed);
+        let error = paste_paths(vec![source.clone()], dest_sandbox.dir.to_string_lossy().to_string(), false, None, &mut progress).unwrap_err();
+        assert_eq!(error, "cancelled:0:5");
+        for permanent in [true, false] {
+            let mut progress = Progress::silent();
+            progress.cancel.store(true, Ordering::Relaxed);
+            let outcome = delete_paths(vec![source.clone()], permanent, &mut progress);
+            assert!(outcome.failures.is_empty() && outcome.cancelled.is_some());
+            assert_eq!(fs::read_dir(&source).unwrap().count(), 5);
+        }
+    }
+
+    #[test]
+    fn restoring_a_partly_deleted_folder_puts_its_files_back() {
+        let sandbox = Sandbox::new("restore-partial");
+        let folder = sandbox.path("half");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("gone.txt"), b"x").unwrap();
+        fs::write(folder.join("kept.txt"), b"x").unwrap();
+        let mut outcome = delete_paths(vec![folder.join("gone.txt").to_string_lossy().to_string()], false, &mut Progress::silent());
+        let entry = outcome.trashed.pop().unwrap();
+        restore_entries(vec![TrashedEntry { path: folder.to_string_lossy().to_string(), items: entry.items, partial: true }]).unwrap();
+        assert!(folder.join("gone.txt").exists() && folder.join("kept.txt").exists());
     }
 
     #[test]
@@ -3310,7 +3414,7 @@ pub fn run() {
     let builder = builder.manage(ClipboardState::default());
     builder
         .setup(|app| { watch_drives(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, create_entry_elevated, rename_entry_elevated, paste_entries_elevated, delete_entries_elevated, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, scan_file_names, stat_entries, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entries, restore_entries,create_file, create_folder, create_entry_elevated, rename_entry_elevated, paste_entries_elevated, delete_entries_elevated, show_properties, lockhunter_info, open_in_lockhunter, platform_name, same_volume, edit_in_text_editor, compress_entries, list_open_with_apps, open_with_app, open_with_other_app, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, scan_file_names, stat_entries, known_folders, existing_folders, read_folders_config, write_folders_config, default_folders_config, get_extension_icon, get_heic_thumbnail, get_video_thumbnail, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries, cancel_file_op])
         .run(tauri::generate_context!())
         .expect("error while running Rove Explorer");
 }
