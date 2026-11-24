@@ -421,8 +421,10 @@ const SHORTCUTS = [
 const APP_DESCRIPTION = 'A focused two-pane file explorer: side-by-side panes with tabs, favorite folders, thumbnails, a folder-size tree view, file-name search, and copy, cut and paste that work with Explorer and Finder.';
 
 // A delete, copy or move that takes a while shows its progress. The overlay goes up at once, though
-// unseen, so nothing else can be started meanwhile, and appears only if the work isn't done quickly.
+// unseen, so nothing else can be started meanwhile, and appears only if the work is still going after
+// PROGRESS_DELAY_MS, so a quick delete or copy of a file or two never flashes it.
 // `measure` is what the bar follows: 'bytes' for a copy, 'files' for a delete.
+const PROGRESS_DELAY_MS = 3000;
 const progressRoot = document.body.appendChild(document.createElement('div'));
 let fileOp = null;
 let fileOpCount = 0;
@@ -432,7 +434,7 @@ async function withProgress(title, paths, measure, work) {
   const what = paths.length === 1 ? `"${itemName(paths[0])}"` : `${paths.length.toLocaleString()} items`;
   progressRoot.innerHTML = `<div class="progress-backdrop" data-progress><section class="dialog progress-dialog" role="dialog" aria-modal="true" aria-label="${escapeAttribute(title)}"><header class="dialog-head"><h2>${escapeAttribute(title)} ${escapeAttribute(what)}</h2></header><div class="dialog-body"><p class="progress-line" data-progress-line>Working…</p><div class="progress-track is-indeterminate" data-progress-track><div class="progress-fill" data-progress-fill></div></div><p class="progress-current" data-progress-current></p><div class="dialog-actions"><span></span><button data-progress-cancel>Cancel</button></div></div></section></div>`;
   progressRoot.querySelector('[data-progress-cancel]').addEventListener('click', cancelFileOp);
-  const timer = setTimeout(() => progressRoot.querySelector('[data-progress]')?.classList.add('is-visible'), 400);
+  const timer = setTimeout(() => progressRoot.querySelector('[data-progress]')?.classList.add('is-visible'), PROGRESS_DELAY_MS);
   try { return await work(op.opId); } finally {
     clearTimeout(timer);
     if (fileOp === op) { fileOp = null; progressRoot.innerHTML = ''; }
