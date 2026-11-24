@@ -309,14 +309,23 @@ const TRASH_NAME: &str = "Recycle Bin";
 #[cfg(not(windows))]
 const TRASH_NAME: &str = "Trash";
 
-#[tauri::command]
-fn delete_entries(paths: Vec<String>, permanent: bool) -> DeleteOutcome {
+// Async so a big delete runs off the main thread, leaving the window free to show its progress.
+#[tauri::command(async)]
+fn delete_entries(app: AppHandle, paths: Vec<String>, permanent: bool, op_id: Option<String>) -> DeleteOutcome {
+    delete_paths(paths, permanent, &mut Progress::new(&app, op_id))
+}
+
+fn delete_paths(paths: Vec<String>, permanent: bool, progress: &mut Progress) -> DeleteOutcome {
     // Deletion times are kept in whole seconds, so allow some slack.
     #[cfg(not(target_os = "macos"))]
     let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|time| time.as_secs() as i64).unwrap_or(0) - 2;
     let mut outcome = DeleteOutcome { trashed: Vec::new(), failures: Vec::new() };
-    for path in paths {
-        let result = if permanent { delete_permanently(&path).map(|_| Vec::new()) } else { delete_entry(path.clone()) };
+    // Count everything first, so the progress can say how far along it is.
+    let finished_at: Vec<u64> = paths.iter().map(|path| { progress.tally(Path::new(path)); progress.report.total_files }).collect();
+    progress.begin();
+    for (path, finished_at) in paths.into_iter().zip(finished_at) {
+        let result = if permanent { delete_permanently(&path, progress).map(|_| Vec::new()) } else { delete_entry(path.clone(), progress) };
+        progress.reach(Path::new(&path), finished_at);
         match result {
             Ok(items) => outcome.trashed.push(TrashedEntry { path, items }),
             Err(error) => outcome.failures.push(DeleteFailure { path, error }),
@@ -327,11 +336,11 @@ fn delete_entries(paths: Vec<String>, permanent: bool) -> DeleteOutcome {
     outcome
 }
 
-fn delete_entry(path: String) -> Result<Vec<TrashedItem>, String> {
+fn delete_entry(path: String, progress: &mut Progress) -> Result<Vec<TrashedItem>, String> {
     let target = Path::new(&path);
     // Windows refuses to delete a protected item (e.g. a system file at the root of C:) the same
     // way it refuses one that's in use, so check whether permissions are really the cause.
-    let items = move_to_trash(&path).map_err(|error| if access_denied(target, DELETE) { NEEDS_ELEVATION.to_string() } else { error })?;
+    let items = move_to_trash_reporting(&path, progress).map_err(|error| if access_denied(target, DELETE) { NEEDS_ELEVATION.to_string() } else { error })?;
     // The shell recycles silently: an item that is in use is skipped yet the operation still
     // reports success, so check what is left behind. Whatever survived inside a folder is what
     // the other program has open (everything else already went to the Recycle Bin).
@@ -341,9 +350,9 @@ fn delete_entry(path: String) -> Result<Vec<TrashedItem>, String> {
 
 // Deletes outright, skipping the trash, as Shift+Delete does. Like the shell it goes on past what
 // it can't delete, so whatever is left inside a folder is what's in use (or protected).
-fn delete_permanently(path: &str) -> Result<(), String> {
+fn delete_permanently(path: &str, progress: &mut Progress) -> Result<(), String> {
     let target = Path::new(path);
-    let result = remove_path(target);
+    let result = remove_path(target, progress);
     if !still_exists(target) { return Ok(()); }
     match result {
         Err(error) if !matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33)) => Err(error.to_string()),
@@ -353,16 +362,22 @@ fn delete_permanently(path: &str) -> Result<(), String> {
 
 // Removes a file, a link (never what it points to) or a folder and everything in it. Returns the
 // last error, after removing all it could.
-fn remove_path(path: &Path) -> std::io::Result<()> {
+fn remove_path(path: &Path, progress: &mut Progress) -> std::io::Result<()> {
     let file_type = fs::symlink_metadata(path)?.file_type();
     if file_type.is_symlink() {
         // A Windows link to a folder (or a junction) is removed as a folder, other links as files.
-        return fs::remove_file(path).or_else(|_| fs::remove_dir(path));
+        let result = fs::remove_file(path).or_else(|_| fs::remove_dir(path));
+        progress.step(path, 1, 0);
+        return result;
     }
-    if !file_type.is_dir() { return remove_file_even_if_read_only(path); }
+    if !file_type.is_dir() {
+        let result = remove_file_even_if_read_only(path);
+        progress.step(path, 1, 0);
+        return result;
+    }
     let mut result = Ok(());
     for entry in fs::read_dir(path)? {
-        if let Err(error) = entry.and_then(|entry| remove_path(&entry.path())) { result = Err(error); }
+        if let Err(error) = entry.and_then(|entry| remove_path(&entry.path(), progress)) { result = Err(error); }
     }
     match fs::remove_dir(path) {
         Err(error) if result.is_ok() => Err(error),
@@ -428,6 +443,137 @@ fn move_to_trash(path: &str) -> Result<Vec<TrashedItem>, String> {
         .map_err(|error| error.localizedDescription().to_string())?;
     let id = resulting_url.and_then(|url| url.path()).map(|path| path.to_string());
     Ok(id.map(|id| TrashedItem { id, original: path.to_string() }).into_iter().collect())
+}
+
+// The trash crate hands a folder's files to the Windows shell in one go, which can take minutes
+// with nothing to show for it. Recycling the files a batch at a time lets the progress move along;
+// the (by then empty) folders follow in one go, as the crate does. Elsewhere a folder is trashed
+// in one move. A folder must never share a batch with what's in it: the crate lists a folder's
+// contents itself, and the shell hangs when given the same file twice.
+#[cfg(windows)]
+fn move_to_trash_reporting(path: &str, progress: &mut Progress) -> Result<Vec<TrashedItem>, String> {
+    const BATCH: usize = 200;
+    let root = Path::new(path);
+    if !fs::symlink_metadata(root).map(|metadata| metadata.is_dir()).unwrap_or(false) { return move_to_trash(path); }
+    let mut files = Vec::new();
+    list_files(root, &mut files);
+    let mut last_error = None;
+    for batch in files.chunks(BATCH) {
+        if let Err(error) = trash::delete_all(batch) { last_error = Some(readable_trash_error(error)); }
+        progress.step(&batch[batch.len() - 1], batch.len() as u64, 0);
+    }
+    // Whatever a failed batch left behind goes with its folder.
+    let folders = move_to_trash(path);
+    match (folders, last_error) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Some(error)) if still_exists(root) => Err(error),
+        (Ok(items), _) => Ok(items),
+    }
+}
+
+#[cfg(not(windows))]
+fn move_to_trash_reporting(path: &str, _progress: &mut Progress) -> Result<Vec<TrashedItem>, String> {
+    move_to_trash(path)
+}
+
+// Every file (and link) anywhere in `dir`.
+#[cfg(windows)]
+fn list_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_type().map(|file_type| file_type.is_dir()).unwrap_or(false) { list_files(&entry.path(), files); } else { files.push(entry.path()); }
+    }
+}
+
+// Progress of a long delete, copy or move, sent to the window as "file-op-progress" events (at
+// most every 100ms) under the id the window gave the operation. Silent without one.
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileOpProgress {
+    op_id: String,
+    counting: bool,
+    done_files: u64,
+    total_files: u64,
+    done_bytes: u64,
+    total_bytes: u64,
+    current: String,
+}
+
+// The window is told through a callback rather than an AppHandle, which keeps Tauri's windowing
+// code (and the system DLLs it needs) out of the unit tests.
+struct Progress {
+    send_to: Option<Box<dyn Fn(&FileOpProgress)>>,
+    report: FileOpProgress,
+    last_sent: Option<Instant>,
+}
+
+impl Progress {
+    fn silent() -> Self {
+        Progress { send_to: None, report: FileOpProgress { counting: true, ..Default::default() }, last_sent: None }
+    }
+
+    fn new(app: &AppHandle, op_id: Option<String>) -> Self {
+        let mut progress = Progress::silent();
+        if let Some(op_id) = op_id {
+            let app = app.clone();
+            progress.send_to = Some(Box::new(move |report| { let _ = app.emit("file-op-progress", report); }));
+            progress.report.op_id = op_id;
+        }
+        progress
+    }
+
+    // Adds what's at `path` (a file, or all the files in a folder, not following links) to the totals.
+    fn tally(&mut self, path: &Path) {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => self.tally_folder(path),
+            Ok(metadata) => self.add_total(path, metadata.len()),
+            Err(_) => {}
+        }
+    }
+
+    fn tally_folder(&mut self, dir: &Path) {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            match entry.metadata() {
+                Ok(metadata) if metadata.is_dir() => self.tally_folder(&entry.path()),
+                Ok(metadata) => self.add_total(&entry.path(), metadata.len()),
+                Err(_) => {}
+            }
+        }
+    }
+
+    fn add_total(&mut self, path: &Path, bytes: u64) {
+        self.report.total_files += 1;
+        self.report.total_bytes += bytes;
+        if self.due() { self.report.current = path.to_string_lossy().into_owned(); self.send(); }
+    }
+
+    // Counting is over; the work itself starts.
+    fn begin(&mut self) {
+        self.report.counting = false;
+        self.send();
+    }
+
+    // `files` more files (and `bytes` more bytes) are done, the last of them at `path`.
+    fn step(&mut self, path: &Path, files: u64, bytes: u64) {
+        self.report.done_files += files;
+        self.report.done_bytes += bytes;
+        if self.due() { self.report.current = path.to_string_lossy().into_owned(); self.send(); }
+    }
+
+    // An item is finished: count everything in it as done, even what was skipped or failed.
+    fn reach(&mut self, path: &Path, done_files: u64) {
+        if done_files > self.report.done_files { self.report.done_files = done_files; }
+        self.step(path, 0, 0);
+    }
+
+    fn due(&self) -> bool {
+        self.send_to.is_some() && self.last_sent.is_none_or(|sent| sent.elapsed() >= std::time::Duration::from_millis(100))
+    }
+
+    fn send(&mut self) {
+        let Some(send_to) = &self.send_to else { return };
+        send_to(&self.report);
+        self.last_sent = Some(Instant::now());
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -627,7 +773,7 @@ fn create_job_file(job: &impl Serialize) -> std::io::Result<(fs::File, PathBuf)>
 #[cfg(windows)]
 fn run_paste_job(job_path: &Path) -> std::io::Result<()> {
     let job: PasteJob = serde_json::from_str(&fs::read_to_string(job_path)?)?;
-    paste_items(&job.paths, Path::new(&job.dest_dir), job.cut, job.conflict_resolution.as_deref()).map(|_| ())
+    paste_items(&job.paths, Path::new(&job.dest_dir), job.cut, job.conflict_resolution.as_deref(), &mut Progress::silent()).map(|_| ())
 }
 
 // Returns what's new in the destination, or None if the UAC prompt is declined. The elevated copy
@@ -695,7 +841,7 @@ fn run_delete_job(job_path: &Path) -> std::io::Result<()> {
     let job: DeleteJob = serde_json::from_str(&fs::read_to_string(job_path)?)?;
     let mut result = Ok(());
     for path in &job.paths {
-        if job.permanent { let _ = remove_path(Path::new(path)); } else { let _ = trash::delete(path); }
+        if job.permanent { let _ = remove_path(Path::new(path), &mut Progress::silent()); } else { let _ = trash::delete(path); }
         let target = Path::new(path);
         if still_exists(target) { result = Err(std::io::Error::from_raw_os_error(if access_denied(target, DELETE) { 5 } else { 32 })); }
     }
@@ -1746,18 +1892,79 @@ fn clipboard_read_paths(state: State<ClipboardState>) -> Result<Option<Clipboard
     Ok(files.clone().map(|(paths, cut)| ClipboardFiles { paths, cut }))
 }
 
-fn copy_dir_recursive(source: &Path, dest: &Path) -> std::io::Result<()> {
+fn copy_dir_recursive(source: &Path, dest: &Path, progress: &mut Progress) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let target = dest.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
+            copy_dir_recursive(&entry.path(), &target, progress)?;
         } else {
-            fs::copy(entry.path(), &target)?;
+            copy_file(&entry.path(), &target, progress)?;
         }
     }
     Ok(())
+}
+
+// fs::copy, counting the file towards the progress. A big file is copied with a callback that
+// reports how much of it is done, so the progress keeps moving while it copies.
+fn copy_file(source: &Path, target: &Path, progress: &mut Progress) -> std::io::Result<u64> {
+    #[cfg(windows)]
+    if progress.send_to.is_some() && fs::metadata(source).map(|metadata| metadata.len() >= 32 << 20).unwrap_or(false) {
+        // If this fails (e.g. on a path too long for it), fs::copy tries again and gives the error.
+        if let Ok(bytes) = copy_big_file(source, target, progress) { progress.step(source, 1, 0); return Ok(bytes); }
+    }
+    let bytes = fs::copy(source, target)?;
+    progress.step(source, 1, bytes);
+    Ok(bytes)
+}
+
+// CopyFileExW is what fs::copy uses too, just without a progress callback.
+#[cfg(windows)]
+fn copy_big_file(source: &Path, target: &Path, progress: &mut Progress) -> std::io::Result<u64> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    struct Copying<'a> { progress: &'a mut Progress, source: &'a Path, reported: u64 }
+    type ProgressRoutine = unsafe extern "system" fn(i64, i64, i64, i64, u32, u32, isize, isize, *mut c_void) -> u32;
+    extern "system" {
+        fn CopyFileExW(existing: *const u16, new: *const u16, routine: Option<ProgressRoutine>, data: *mut c_void, cancel: *mut i32, flags: u32) -> i32;
+    }
+    unsafe extern "system" fn on_progress(_total: i64, transferred: i64, _stream_size: i64, _stream_transferred: i64, _stream: u32, _reason: u32, _source: isize, _target: isize, data: *mut c_void) -> u32 {
+        let copying = &mut *(data as *mut Copying);
+        let transferred = transferred.max(0) as u64;
+        if transferred > copying.reported {
+            let added = transferred - copying.reported;
+            copying.reported = transferred;
+            copying.progress.step(copying.source, 0, added);
+        }
+        0 // PROGRESS_CONTINUE
+    }
+    let wide = |path: &Path| path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (source_wide, target_wide) = (wide(source), wide(target));
+    let mut copying = Copying { progress, source, reported: 0 };
+    let copied = unsafe { CopyFileExW(source_wide.as_ptr(), target_wide.as_ptr(), Some(on_progress), &mut copying as *mut Copying as *mut c_void, std::ptr::null_mut(), 0) };
+    if copied == 0 {
+        // Take back what a failed copy reported, since fs::copy will count the file again.
+        let error = std::io::Error::last_os_error();
+        copying.progress.report.done_bytes -= copying.reported;
+        return Err(error);
+    }
+    Ok(copying.reported)
+}
+
+// Whether a cut-and-paste of `source` into `dest` can be a rename, which is instant. A guess: if
+// the rename fails after all, the move copies instead (and counts the item then).
+fn likely_same_volume(source: &Path, dest: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        matches!((fs::symlink_metadata(source), fs::metadata(dest)), (Ok(source), Ok(dest)) if source.dev() == dest.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let root = |path: &Path| path.components().next().map(|part| part.as_os_str().to_string_lossy().to_lowercase());
+        root(source).is_some() && root(source) == root(dest)
+    }
 }
 
 // Mirrors Explorer's conflict handling: never overwrite silently, instead find the next free
@@ -1825,26 +2032,28 @@ fn scan_paste_conflicts(paths: Vec<String>, dest_dir: String) -> Result<Vec<Stri
 // replaced or left alone per `resolution`; for a cut, a file is only removed from `source` once
 // it has actually landed in `dest`, so a skipped file simply stays behind instead of being lost,
 // and a folder is only pruned once it has been fully drained by removing an (expectedly) empty dir.
-fn merge_dir_recursive(source: &Path, dest: &Path, cut: bool, resolution: ConflictResolution) -> std::io::Result<()> {
+fn merge_dir_recursive(source: &Path, dest: &Path, cut: bool, resolution: ConflictResolution, progress: &mut Progress) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let entry_path = entry.path();
         let target = dest.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            merge_dir_recursive(&entry_path, &target, cut, resolution)?;
+            merge_dir_recursive(&entry_path, &target, cut, resolution, progress)?;
             if cut {
                 let _ = fs::remove_dir(&entry_path);
             }
         } else if target.exists() {
             if resolution == ConflictResolution::Replace {
-                fs::copy(&entry_path, &target)?;
+                copy_file(&entry_path, &target, progress)?;
                 if cut {
                     fs::remove_file(&entry_path)?;
                 }
+            } else {
+                progress.step(&entry_path, 1, entry.metadata().map(|metadata| metadata.len()).unwrap_or(0));
             }
         } else {
-            fs::copy(&entry_path, &target)?;
+            copy_file(&entry_path, &target, progress)?;
             if cut {
                 fs::remove_file(&entry_path)?;
             }
@@ -1869,16 +2078,33 @@ fn paste_needs_elevation(paths: &[String], dest: &Path, cut: bool) -> bool {
     })
 }
 
-#[tauri::command]
-fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool, conflict_resolution: Option<String>) -> Result<Vec<String>, String> {
-    let dest = Path::new(&dest_dir);
-    if paste_needs_elevation(&paths, dest, cut) { return Err(NEEDS_ELEVATION.to_string()); }
-    paste_items(&paths, dest, cut, conflict_resolution.as_deref()).map_err(|error| error.to_string())
+// Async so a big copy runs off the main thread, leaving the window free to show its progress.
+#[tauri::command(async)]
+fn paste_entries(app: AppHandle, paths: Vec<String>, dest_dir: String, cut: bool, conflict_resolution: Option<String>, op_id: Option<String>) -> Result<Vec<String>, String> {
+    paste_paths(paths, dest_dir, cut, conflict_resolution, &mut Progress::new(&app, op_id))
 }
 
-fn paste_items(paths: &[String], dest: &Path, cut: bool, conflict_resolution: Option<&str>) -> std::io::Result<Vec<String>> {
+fn paste_paths(paths: Vec<String>, dest_dir: String, cut: bool, conflict_resolution: Option<String>, progress: &mut Progress) -> Result<Vec<String>, String> {
+    let dest = Path::new(&dest_dir);
+    if paste_needs_elevation(&paths, dest, cut) { return Err(NEEDS_ELEVATION.to_string()); }
+    paste_items(&paths, dest, cut, conflict_resolution.as_deref(), progress).map_err(|error| error.to_string())
+}
+
+// Whether pasting `source` copies its contents, rather than doing nothing or renaming it.
+fn paste_copies(source: &Path, dest: &Path, cut: bool) -> bool {
+    if (cut && source.parent() == Some(dest)) || is_same_or_inside(dest, source) { return false; }
+    let merges = source.is_dir() && source.file_name().is_some_and(|name| dest.join(name).is_dir());
+    !cut || merges || !likely_same_volume(source, dest)
+}
+
+fn paste_items(paths: &[String], dest: &Path, cut: bool, conflict_resolution: Option<&str>, progress: &mut Progress) -> std::io::Result<Vec<String>> {
     let resolution = if conflict_resolution == Some("replace") { ConflictResolution::Replace } else { ConflictResolution::Skip };
     let mut results = Vec::with_capacity(paths.len());
+    // Count what will be copied first, so the progress can say how far along it is.
+    for source_path in paths {
+        if paste_copies(Path::new(source_path), dest, cut) { progress.tally(Path::new(source_path)); }
+    }
+    progress.begin();
     for source_path in paths {
         let source = Path::new(source_path);
         let Some(name) = source.file_name().map(|value| value.to_string_lossy().to_string()) else { continue };
@@ -1894,7 +2120,7 @@ fn paste_items(paths: &[String], dest: &Path, cut: bool, conflict_resolution: Op
         let existing_target = dest.join(&name);
         if source.is_dir() && existing_target.is_dir() {
             // A same-named folder already lives here: merge into it instead of renaming a copy alongside it.
-            merge_dir_recursive(source, &existing_target, cut, resolution)?;
+            merge_dir_recursive(source, &existing_target, cut, resolution, progress)?;
             if cut {
                 let _ = fs::remove_dir(source);
             }
@@ -1904,18 +2130,19 @@ fn paste_items(paths: &[String], dest: &Path, cut: bool, conflict_resolution: Op
         let target = unique_destination(dest, &name);
         if cut {
             if fs::rename(source, &target).is_err() {
+                if !paste_copies(source, dest, cut) { progress.tally(source); }
                 if source.is_dir() {
-                    copy_dir_recursive(source, &target)?;
+                    copy_dir_recursive(source, &target, progress)?;
                     fs::remove_dir_all(source)?;
                 } else {
-                    fs::copy(source, &target)?;
+                    copy_file(source, &target, progress)?;
                     fs::remove_file(source)?;
                 }
             }
         } else if source.is_dir() {
-            copy_dir_recursive(source, &target)?;
+            copy_dir_recursive(source, &target, progress)?;
         } else {
-            fs::copy(source, &target)?;
+            copy_file(source, &target, progress)?;
         }
         results.push(target.to_string_lossy().to_string());
     }
@@ -1957,7 +2184,7 @@ mod paste_entries_tests {
         fs::create_dir_all(&folder).unwrap();
         fs::write(folder.join("photo.jpg"), b"x").unwrap();
         let lock = fs::OpenOptions::new().read(true).share_mode(0).open(folder.join("photo.jpg")).unwrap();
-        let error = delete_entry(folder.to_string_lossy().to_string()).unwrap_err();
+        let error = delete_entry(folder.to_string_lossy().to_string(), &mut Progress::silent()).unwrap_err();
         drop(lock);
         assert!(folder.exists());
         assert!(error.contains("being used by another program") && error.contains("photo.jpg"), "{error}");
@@ -1973,7 +2200,7 @@ mod paste_entries_tests {
         fs::write(folder.join("photo.jpg"), b"x").unwrap();
         fs::write(folder.join("other.jpg"), b"x").unwrap();
         let lock = fs::OpenOptions::new().read(true).share_mode(0).open(folder.join("photo.jpg")).unwrap();
-        let error = delete_permanently(&folder.to_string_lossy()).unwrap_err();
+        let error = delete_permanently(&folder.to_string_lossy(), &mut Progress::silent()).unwrap_err();
         drop(lock);
         assert!(error.contains("being used by another program") && error.contains("photo.jpg"), "{error}");
         assert!(!folder.join("other.jpg").exists(), "what isn't in use still goes");
@@ -1990,7 +2217,7 @@ mod paste_entries_tests {
         permissions.set_readonly(true);
         fs::set_permissions(sandbox.path("pix/locked.txt"), permissions).unwrap();
         let paths = ["note.txt", "pix"].map(|name| sandbox.path(name).to_string_lossy().to_string()).to_vec();
-        let outcome = delete_entries(paths, true);
+        let outcome = delete_paths(paths, true, &mut Progress::silent());
         assert!(outcome.failures.is_empty(), "{:?}", outcome.failures.iter().map(|failure| &failure.error).collect::<Vec<_>>());
         assert!(outcome.trashed.iter().all(|entry| entry.items.is_empty()), "nothing to undo");
         assert!(!sandbox.path("note.txt").exists() && !sandbox.path("pix").exists());
@@ -2006,7 +2233,7 @@ mod paste_entries_tests {
         fs::write(sandbox.path("real/keep.txt"), b"x").unwrap();
         let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(sandbox.path("link")).arg(sandbox.path("real")).output().unwrap();
         assert!(made.status.success());
-        delete_permanently(&sandbox.path("link").to_string_lossy()).unwrap();
+        delete_permanently(&sandbox.path("link").to_string_lossy(), &mut Progress::silent()).unwrap();
         assert!(!sandbox.path("link").exists());
         assert!(sandbox.path("real/keep.txt").exists());
     }
@@ -2020,7 +2247,7 @@ mod paste_entries_tests {
         fs::create_dir_all(sandbox.path("pix").join("trip")).unwrap();
         fs::write(sandbox.path("pix").join("trip").join("beach.jpg"), b"x").unwrap();
         let paths = ["note.txt", "pix"].map(|name| sandbox.path(name).to_string_lossy().to_string()).to_vec();
-        let outcome = delete_entries(paths, false);
+        let outcome = delete_paths(paths, false, &mut Progress::silent());
         assert!(outcome.failures.is_empty());
         assert!(!sandbox.path("note.txt").exists() && !sandbox.path("pix").exists());
         assert!(outcome.trashed.iter().all(|entry| !entry.items.is_empty()));
@@ -2035,11 +2262,40 @@ mod paste_entries_tests {
     }
 
     #[test]
+    fn recycling_a_big_folder_counts_every_file_and_can_be_undone() {
+        let sandbox = Sandbox::new("delete-big");
+        let folder = sandbox.path("big");
+        for sub in ["a", "b/c"] { fs::create_dir_all(folder.join(sub)).unwrap(); }
+        for index in 0..450 { fs::write(folder.join(["a", "b", "b/c"][index % 3]).join(format!("{index}.txt")), b"x").unwrap(); }
+        let mut progress = Progress::silent();
+        let outcome = delete_paths(vec![folder.to_string_lossy().to_string()], false, &mut progress);
+        assert!(outcome.failures.is_empty());
+        assert!(!folder.exists());
+        assert_eq!((progress.report.done_files, progress.report.total_files), (450, 450));
+        restore_entries(outcome.trashed).unwrap();
+        assert_eq!(fs::read_dir(folder.join("b/c")).unwrap().count(), 150);
+    }
+
+    #[test]
+    fn copy_progress_counts_files_and_bytes() {
+        let source_sandbox = Sandbox::new("progress-src");
+        let dest_sandbox = Sandbox::new("progress-dest");
+        fs::create_dir_all(source_sandbox.path("folder/inner")).unwrap();
+        fs::write(source_sandbox.path("folder/one.txt"), b"12345").unwrap();
+        fs::write(source_sandbox.path("folder/inner/two.txt"), b"678").unwrap();
+        let mut progress = Progress::silent();
+        paste_paths(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, None, &mut progress).unwrap();
+        let report = &progress.report;
+        assert_eq!((report.done_files, report.total_files, report.done_bytes, report.total_bytes), (2, 2, 8, 8));
+        assert!(!report.counting);
+    }
+
+    #[test]
     fn restore_skips_items_whose_name_is_taken() {
         let sandbox = Sandbox::new("restore-taken");
         fs::write(sandbox.path("a.txt"), b"old").unwrap();
         fs::write(sandbox.path("b.txt"), b"b").unwrap();
-        let outcome = delete_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string(), sandbox.path("b.txt").to_string_lossy().to_string()], false);
+        let outcome = delete_paths(vec![sandbox.path("a.txt").to_string_lossy().to_string(), sandbox.path("b.txt").to_string_lossy().to_string()], false, &mut Progress::silent());
         fs::write(sandbox.path("a.txt"), b"new").unwrap();
         let error = restore_entries(outcome.trashed).unwrap_err();
         assert!(error.contains("a.txt") && error.contains("already there"), "{error}");
@@ -2204,12 +2460,12 @@ mod paste_entries_tests {
         let folder = create_folder(locked_text.clone());
         let file = create_file(locked_text.clone());
         let rename = rename_entry(held_text.clone(), "other.txt".to_string());
-        let paste_in = paste_entries(vec![source.clone()], locked_text.clone(), false, None);
-        let move_out = paste_entries(vec![held_text.clone()], open.clone(), true, None);
+        let paste_in = paste_paths(vec![source.clone()], locked_text.clone(), false, None, &mut Progress::silent());
+        let move_out = paste_paths(vec![held_text.clone()], open.clone(), true, None, &mut Progress::silent());
         let moved_copy_left = sandbox.path("open/held.txt").exists();
-        let copy_out = paste_entries(vec![held_text.clone()], open.clone(), false, None);
-        let delete_file = delete_entry(held_text.clone());
-        let delete_file_permanently = delete_permanently(&held_text);
+        let copy_out = paste_paths(vec![held_text.clone()], open.clone(), false, None, &mut Progress::silent());
+        let delete_file = delete_entry(held_text.clone(), &mut Progress::silent());
+        let delete_file_permanently = delete_permanently(&held_text, &mut Progress::silent());
         let elevated_delete_left_it = held.exists();
         icacls(&locked, &["/remove:d", EVERYONE]);
         icacls(&held, &["/remove:d", EVERYONE]);
@@ -2253,7 +2509,7 @@ mod paste_entries_tests {
         let source = sandbox.path("a").to_string_lossy().to_string();
         for cut in [false, true] {
             for dest in [sandbox.path("a"), sandbox.path("a").join("sub")] {
-                let result = paste_entries(vec![source.clone()], dest.to_string_lossy().to_string(), cut, None).unwrap();
+                let result = paste_paths(vec![source.clone()], dest.to_string_lossy().to_string(), cut, None, &mut Progress::silent()).unwrap();
                 assert!(result.is_empty());
             }
         }
@@ -2276,7 +2532,7 @@ mod paste_entries_tests {
     fn copy_paste_duplicates_into_new_name_in_same_folder() {
         let sandbox = Sandbox::new("copy-same-folder");
         fs::write(sandbox.path("a.txt"), b"hello").unwrap();
-        let result = paste_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), false, None).unwrap();
+        let result = paste_paths(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), false, None, &mut Progress::silent()).unwrap();
         assert_eq!(result, vec![sandbox.path("a - Copy.txt").to_string_lossy().to_string()]);
         assert!(sandbox.path("a.txt").exists());
         assert_eq!(fs::read_to_string(sandbox.path("a - Copy.txt")).unwrap(), "hello");
@@ -2286,7 +2542,7 @@ mod paste_entries_tests {
     fn cut_paste_into_same_folder_is_a_no_op() {
         let sandbox = Sandbox::new("cut-same-folder");
         fs::write(sandbox.path("a.txt"), b"hello").unwrap();
-        let result = paste_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), true, None).unwrap();
+        let result = paste_paths(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), true, None, &mut Progress::silent()).unwrap();
         assert_eq!(result, vec![sandbox.path("a.txt").to_string_lossy().to_string()]);
         assert!(sandbox.path("a.txt").exists());
     }
@@ -2296,7 +2552,7 @@ mod paste_entries_tests {
         let source_sandbox = Sandbox::new("cut-source");
         let dest_sandbox = Sandbox::new("cut-dest");
         fs::write(source_sandbox.path("a.txt"), b"hello").unwrap();
-        let result = paste_entries(vec![source_sandbox.path("a.txt").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), true, None).unwrap();
+        let result = paste_paths(vec![source_sandbox.path("a.txt").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), true, None, &mut Progress::silent()).unwrap();
         assert_eq!(result, vec![dest_sandbox.path("a.txt").to_string_lossy().to_string()]);
         assert!(!source_sandbox.path("a.txt").exists());
         assert_eq!(fs::read_to_string(dest_sandbox.path("a.txt")).unwrap(), "hello");
@@ -2309,7 +2565,7 @@ mod paste_entries_tests {
         fs::create_dir_all(source_sandbox.path("folder/nested")).unwrap();
         fs::write(source_sandbox.path("folder/file.txt"), b"top").unwrap();
         fs::write(source_sandbox.path("folder/nested/inner.txt"), b"deep").unwrap();
-        paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, None).unwrap();
+        paste_paths(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, None, &mut Progress::silent()).unwrap();
         assert_eq!(fs::read_to_string(dest_sandbox.path("folder/file.txt")).unwrap(), "top");
         assert_eq!(fs::read_to_string(dest_sandbox.path("folder/nested/inner.txt")).unwrap(), "deep");
         assert!(source_sandbox.path("folder").exists());
@@ -2356,7 +2612,7 @@ mod paste_entries_tests {
         fs::write(dest_sandbox.path("folder/existing.txt"), b"existing").unwrap();
         fs::write(dest_sandbox.path("folder/clash.txt"), b"dest version").unwrap();
 
-        let result = paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, Some("skip".to_string())).unwrap();
+        let result = paste_paths(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, Some("skip".to_string()), &mut Progress::silent()).unwrap();
         assert_eq!(result, vec![dest_sandbox.path("folder").to_string_lossy().to_string()]);
         // Merged: both the pre-existing and the newly copied file are present.
         assert_eq!(fs::read_to_string(dest_sandbox.path("folder/existing.txt")).unwrap(), "existing");
@@ -2376,7 +2632,7 @@ mod paste_entries_tests {
         fs::create_dir_all(dest_sandbox.path("folder")).unwrap();
         fs::write(dest_sandbox.path("folder/clash.txt"), b"dest version").unwrap();
 
-        paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, Some("replace".to_string())).unwrap();
+        paste_paths(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, Some("replace".to_string()), &mut Progress::silent()).unwrap();
         assert_eq!(fs::read_to_string(dest_sandbox.path("folder/clash.txt")).unwrap(), "source version");
     }
 
@@ -2390,7 +2646,7 @@ mod paste_entries_tests {
         fs::create_dir_all(dest_sandbox.path("folder")).unwrap();
         fs::write(dest_sandbox.path("folder/clash.txt"), b"dest version").unwrap();
 
-        paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), true, Some("skip".to_string())).unwrap();
+        paste_paths(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), true, Some("skip".to_string()), &mut Progress::silent()).unwrap();
         // Non-conflicting file was moved out of the source.
         assert!(!source_sandbox.path("folder/moved.txt").exists());
         assert_eq!(fs::read_to_string(dest_sandbox.path("folder/moved.txt")).unwrap(), "moved");

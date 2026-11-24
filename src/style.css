@@ -93,3 +93,15 @@ html, body, #app { height: 100%; overflow: hidden; }
 .search-folder { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-folder em { font-style: normal; color: #b3b5ad; }
 .name-tip { position: fixed; z-index: 20; max-width: 320px; padding: 8px 10px; white-space: pre-line; font-size: 12px; line-height: 1.5; color: var(--ink); background: #fffbe6; border: 1px solid #c9b458; box-shadow: 0 4px 14px rgba(36,38,35,.18); pointer-events: none; }
+.progress-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 16px; background: transparent; cursor: progress; }
+.progress-backdrop > .dialog { visibility: hidden; }
+.progress-backdrop.is-visible { background: rgba(36,38,35,.28); }
+.progress-backdrop.is-visible > .dialog { visibility: visible; }
+.progress-dialog { width: min(480px, 100%); cursor: default; }
+.progress-dialog h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.progress-line { font: 11px 'DM Mono'; color: var(--ink); }
+.progress-track { position: relative; height: 8px; margin-top: 10px; overflow: hidden; background: #ecefe0; border: 1px solid var(--line); }
+.progress-fill { height: 100%; width: 0; background: #8ca42b; transition: width .15s linear; }
+.progress-track.is-indeterminate .progress-fill { position: absolute; width: 30%; animation: rove-explorer-sweep 1.2s ease-in-out infinite; transition: none; }
+@keyframes rove-explorer-sweep { from { left: -30%; } to { left: 100%; } }
+.progress-current { min-height: 1.55em; margin-top: 8px !important; font: 10px 'DM Mono'; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

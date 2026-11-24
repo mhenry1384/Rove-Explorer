@@ -420,6 +420,54 @@ const SHORTCUTS = [
 ];
 const APP_DESCRIPTION = 'A focused two-pane file explorer: side-by-side panes with tabs, favorite folders, thumbnails, a folder-size tree view, file-name search, and copy, cut and paste that work with Explorer and Finder.';
 
+// A delete, copy or move that takes a while shows its progress. The overlay goes up at once, though
+// unseen, so nothing else can be started meanwhile, and appears only if the work isn't done quickly.
+// `measure` is what the bar follows: 'bytes' for a copy, 'files' for a delete.
+const progressRoot = document.body.appendChild(document.createElement('div'));
+let fileOp = null;
+let fileOpCount = 0;
+async function withProgress(title, paths, measure, work) {
+  const op = { opId: `op-${++fileOpCount}`, measure, workStarted: null };
+  fileOp = op;
+  const what = paths.length === 1 ? `"${itemName(paths[0])}"` : `${paths.length.toLocaleString()} items`;
+  progressRoot.innerHTML = `<div class="progress-backdrop" data-progress><section class="dialog progress-dialog" role="dialog" aria-modal="true" aria-label="${escapeAttribute(title)}"><header class="dialog-head"><h2>${escapeAttribute(title)} ${escapeAttribute(what)}</h2></header><div class="dialog-body"><p class="progress-line" data-progress-line>Working…</p><div class="progress-track is-indeterminate" data-progress-track><div class="progress-fill" data-progress-fill></div></div><p class="progress-current" data-progress-current></p></div></section></div>`;
+  const timer = setTimeout(() => progressRoot.querySelector('[data-progress]')?.classList.add('is-visible'), 400);
+  try { return await work(op.opId); } finally {
+    clearTimeout(timer);
+    if (fileOp === op) { fileOp = null; progressRoot.innerHTML = ''; }
+  }
+}
+
+function showFileOpProgress(report) {
+  const op = fileOp;
+  if (!op || report.opId !== op.opId) return;
+  const line = progressRoot.querySelector('[data-progress-line]');
+  const track = progressRoot.querySelector('[data-progress-track]');
+  if (!line || !track) return;
+  progressRoot.querySelector('[data-progress-current]').textContent = report.current || '';
+  if (report.counting) { line.textContent = `Counting files… ${report.totalFiles.toLocaleString()} found`; return; }
+  const byBytes = op.measure === 'bytes' && report.totalBytes > 0;
+  const [done, total] = byBytes ? [report.doneBytes, report.totalBytes] : [report.doneFiles, report.totalFiles];
+  if (!total) return;
+  const fraction = Math.min(1, done / total);
+  op.workStarted ??= Date.now();
+  const files = `${report.doneFiles.toLocaleString()} of ${report.totalFiles.toLocaleString()} file${report.totalFiles === 1 ? '' : 's'}`;
+  const bytes = byBytes ? ` · ${formatBytes(report.doneBytes)} of ${formatBytes(report.totalBytes)}` : '';
+  line.textContent = `${Math.floor(fraction * 100)}% · ${files}${bytes}${timeLeft(op.workStarted, fraction)}`;
+  track.classList.remove('is-indeterminate');
+  progressRoot.querySelector('[data-progress-fill]').style.width = `${fraction * 100}%`;
+}
+
+// Guessed from the pace so far, once there's enough of it to go on.
+function timeLeft(started, fraction) {
+  const elapsed = (Date.now() - started) / 1000;
+  if (elapsed < 3 || fraction < 0.01 || fraction >= 1) return '';
+  const seconds = Math.round(elapsed / fraction - elapsed);
+  if (seconds < 60) return ` · about ${Math.max(seconds, 1)} second${seconds === 1 ? '' : 's'} left`;
+  const minutes = Math.round(seconds / 60);
+  return ` · about ${minutes} minute${minutes === 1 ? '' : 's'} left`;
+}
+
 // Dialogs live outside #app so re-renders (e.g. a folder refreshing behind one) leave them alone.
 const dialogRoot = document.body.appendChild(document.createElement('div'));
 function isDialogOpen() { return !!dialogRoot.firstChild; }
@@ -913,7 +961,12 @@ async function deleteEntries(index, entries, permanent = false) {
 // Items only an administrator may delete are tried again as administrator, after the Windows
 // prompt. What goes that way can't be undone, so it comes back with no trashed items.
 async function deleteWithElevation(paths, permanent = false) {
-  const { trashed, failures } = await invoke('delete_entries', { paths, permanent });
+  const title = permanent ? 'Deleting' : `Moving to the ${TRASH_NAME}`;
+  return withProgress(title, paths, 'files', (opId) => deleteWithElevationNow(paths, permanent, opId));
+}
+
+async function deleteWithElevationNow(paths, permanent, opId) {
+  const { trashed, failures } = await invoke('delete_entries', { paths, permanent, opId });
   const denied = failures.filter(({ error }) => needsElevation(error));
   if (!denied.length) return { trashed, failures };
   const others = failures.filter(({ error }) => !needsElevation(error));
@@ -977,10 +1030,12 @@ async function cutSelected(index) {
 // Null if the Windows admin prompt is declined or the paste failed, which is reported here.
 async function pasteWithElevation(args) {
   try {
-    try { return await invoke('paste_entries', args); } catch (error) {
-      if (!needsElevation(error)) throw error;
-      return await invoke('paste_entries_elevated', args);
-    }
+    return await withProgress(args.cut ? 'Moving' : 'Copying', args.paths, 'bytes', async (opId) => {
+      try { return await invoke('paste_entries', { ...args, opId }); } catch (error) {
+        if (!needsElevation(error)) throw error;
+        return await invoke('paste_entries_elevated', args);
+      }
+    });
   } catch (error) {
     await message(`Couldn't finish copying or moving.\n\n${error}`, { title: 'Paste failed', kind: 'error' });
     return null;
@@ -1785,6 +1840,8 @@ function bindEvents() {
 }
 
 document.addEventListener('keydown', (event) => {
+  // While a delete, copy or move is running, the keyboard waits for it.
+  if (fileOp) { event.preventDefault(); return; }
   // An open dialog takes the keyboard; Tab and Enter still work on its buttons and link.
   if (isDialogOpen()) { if (event.key === 'Escape') { event.preventDefault(); closeDialog(); } return; }
   if (event.key === 'F1') { event.preventDefault(); showShortcuts(); return; }
@@ -1912,6 +1969,7 @@ listen('drives-changed', async () => {
   render();
 });
 listen('fs-changed', (event) => { scheduleFolderReload(event.payload); scheduleRescans(event.payload); });
+listen('file-op-progress', (event) => showFileOpProgress(event.payload));
 listen('tree-progress', (event) => {
   const tab = findTabByTreeRequest(event.payload.requestId);
   if (!tab || tab.treeState.status !== 'loading') return;
